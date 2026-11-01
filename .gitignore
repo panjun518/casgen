@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+casgen_debug.log
+casgen*.log
+.DS_Store
+*.fpk
+casgen_auth.json
+casgen_monitors.json
+casgen_dir_history.json
+项目总结.md
+commit_msg.txt
+.msg
+commit_msg.txt

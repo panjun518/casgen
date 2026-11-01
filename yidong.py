@@ -1,0 +1,1086 @@
+"""移动139 云盘模块 - 纯标准库实现（无需 pip 安装任何依赖）。
+
+⚠️ 已对照 OpenList 官方 139 驱动源码 + 52pojie 逆向帖修正：
+   - 真实 API 主机是【动态的】，必须先调路由策略接口
+     POST https://user-njs.yun.139.com/user/route/qryRoutePolicy
+     取回 personal 模块的 httpsUrl，再用作 /file/* 的 host。
+     （之前写死 yun.139.com 是网页门户，所以返回整页 HTML。）
+   - 每个请求都要带 mcloud-sign 签名，算法见 cal_sign()。
+   - 列举文件：POST {host}/file/list  （body 见 list_dir）
+   - 文件夹判断：item["type"] == "folder"
+   - 文件字段：fileId / name / size / type
+   - 上传 cas / 恢复(秒传) / 删除 接口已按 OpenList 驱动实现，但【尚未真机实测】，
+     需用户试跑反馈后再微调（见文件末尾说明）。
+"""
+
+import base64
+import hashlib
+import json
+import os
+import random
+import string
+import time
+import urllib.parse
+import urllib.request
+import urllib.error
+import threading
+
+# 视频扩展名白名单：generate 只转这些，避免误转图片/文本，并根治 .cas 后缀叠加 bug
+VIDEO_EXT = {
+    ".mp4", ".mkv", ".ts", ".avi", ".mov", ".flv", ".wmv",
+    ".rmvb", ".mpg", ".mpeg", ".m4v", ".webm", ".3gp", ".vob",
+}
+
+# CAS 可转换扩展名（在视频基础上新增光盘镜像 / 磁盘映像 / 蓝光流式等）。
+# 2026-08：新增 ISO / IMG / M2TS 支持，让光盘镜像类文件也能零流量转 CAS。
+# 支持环境变量 CASGEN_EXTS 追加扩展名（逗号分隔，可带或不带点，如 "iso,img,m2ts"），
+# 无需改代码即可让任意冷门格式也能转 CAS。
+CAS_EXT = set(VIDEO_EXT)
+CAS_EXT |= {".iso", ".img", ".m2ts"}
+_env_cas_exts = os.environ.get("CASGEN_EXTS", "")
+if _env_cas_exts:
+    for _e in _env_cas_exts.split(","):
+        _e = _e.strip().lower()
+        if not _e:
+            continue
+        if not _e.startswith("."):
+            _e = "." + _e
+        CAS_EXT.add(_e)
+
+
+# ---------- [6.1.5] 防重复生成 CAS：同一目标目录串行化 + 实时去重 ----------
+# 根因：generate 的去重只依赖「启动时一次性快照 existing」，且全程无锁。
+# 一旦同一个目标目录被并发/重复触发（手动连点、一条龙后台线程、链接监控扫描撞车），
+# 两次 generate 各自在开始时拍快照、都「没看到对方还没落地的 cas」→ 都判定不存在 → 都上传。
+# 而 upload_cas 用的是 fileRenameMode=auto_rename：139 遇到同名不会拒绝，而是另存成
+# "name (1).cas" 副本。于是并发几次就产生 2/3/4 个副本。
+# 修复：① 给同一 root 加锁，串行执行，杜绝并发快照过期；② 上传前实时查 139 是否已有同名 cas，
+#       有就跳过（兜底，连「不同 root 路径指向同一文件夹」这种刁钻情况也能挡住）；
+#       ③ upload_cas 自身再加一道「已存在即跳过」，让 139 永远没有机会用 auto_rename 造副本。
+_GEN_LOCKS = {}
+_GEN_LOCKS_GUARD = threading.Lock()
+
+
+def _gen_lock_for(root):
+    with _GEN_LOCKS_GUARD:
+        lk = _GEN_LOCKS.get(root)
+        if lk is None:
+            lk = threading.Lock()
+            _GEN_LOCKS[root] = lk
+        return lk
+
+# 版本号：每次重打包都在这里改，方便核对是否用上了最新修复
+# 2026-07-22b：修复 file/create 的 parentFileId 错用文件自身 ID（00010002）的问题
+# 5.0：登录态持久化（localStorage 自动重登）、刷新不再丢失；修复 login_status 崩溃；监控状态保留错误
+# 6.1.0：新增 ISO / IMG / M2TS 等光盘镜像类转 CAS 支持；CAS_EXT 改用环境变量 CASGEN_EXTS 可追加扩展名
+# 6.1.1：修复「分享一条龙」勾选「转存后加入监控」无效——前端 share.html 传的参数名是 add_to_monitor，
+#        后端 app.py 却读 monitor，两边不一致导致加监控分支从未执行：用户勾了也毫无反应、
+#        监控列表始终为空，且因为异常与返回值都没透出，前端连一句报错都不显示（静默失败）。
+#        现后端两种写法都认；并补齐返回字段 addToMonitor 与 monitor（含 id、intervalMin），
+#        使前端能正确提示「已加入监控」并自动刷新监控列表。
+# 6.1.2：新增**独立数据目录**支持——环境变量 CASGEN_DATA_DIR（Docker 镜像内默认 /data），
+#        登录态 / 监控清单 / 调试日志统一写入该目录，挂载 /data 一个目录即可持久化；
+#        旧数据（散落在代码目录里的 json）首次启动自动迁移，升级不丢登录态与监控清单。
+#        解决：Docker/飞牛部署时把宿主机目录挂到 /app 会遮住代码、容器起不来的经典踩坑。
+# 6.1.5：根治「同一目录重复/并发生成 CAS 产生 2~4 个副本」——generate 的去重原本只依赖启动时
+#        一次性快照，且全程无锁：手动连点 / 一条龙后台线程 / 链接监控扫描一旦并发触发，各自在启动瞬间
+#        拍快照、都以为 cas 还没生成、于是都去上传；而 upload_cas 用的是 fileRenameMode=auto_rename，
+#        139 遇到同名不会拒绝，而是另存成 "name (1).cas" 副本。修复三件套：① 同一目标目录串行锁
+#        （_gen_lock_for），杜绝并发快照过期；② 上传前实时问 139 是否已存在同名 cas，有则跳过；
+#        ③ upload_cas 自身再加「已存在即跳过」，让 139 永远没机会用 auto_rename 造副本。
+__version__ = "8.0.2"
+
+
+# ============================ 签名相关（来自 52pojie 逆向） ============================
+def _md5(s: str) -> str:
+    return hashlib.md5(s.encode("utf-8")).hexdigest()
+
+
+def _encode_uri_component(s: str) -> str:
+    """等价于 JavaScript 的 encodeURIComponent（与 Go 版 url.QueryEscape+替换 行为一致）。"""
+    # Go 的 url.QueryEscape 只保留 A-Za-z0-9 -_.~ 不转义，空格->'+'；
+    # 这里用 quote(safe='-_.!~*'()') 保留同样字符集，空格等转 %XX。
+    r = urllib.parse.quote(s, safe="-_.!~*'()")
+    return r
+
+
+def cal_sign(body: str, ts: str, rand_str: str) -> str:
+    """移动云盘 mcloud-sign 签名算法（与官方一致）。
+
+    sign = Upper( MD5( MD5(Base64(sort(encodeURIComponent(body)))) + MD5(ts + ":" + randStr) ) )
+    """
+    body = _encode_uri_component(body)
+    chars = sorted(list(body))          # Go sort.Strings：按字节/字符升序
+    body = "".join(chars)
+    body = base64.b64encode(body.encode("utf-8")).decode("ascii")
+    res = _md5(body) + _md5(ts + ":" + rand_str)
+    return _md5(res).upper()
+
+
+_RAND_CHARS = string.ascii_letters + string.digits
+
+
+def _rand_str(n=16) -> str:
+    return "".join(random.choice(_RAND_CHARS) for _ in range(n))
+
+
+# ============================ 登录失效检测 ============================
+class TokenExpired(Exception):
+    """139 登录态失效（token 过期/被踢/异地登录），需提示用户重新登录。"""
+
+
+# 已知失效错误码（取自 share139.FATAL_CODES 中与认证相关的项）
+_AUTH_FAIL_CODES = {"05050006", "04000005"}
+# 失效关键词兜底：接口返回的 message/desc 里出现这些即视为失效，
+# 覆盖「码未知但语义明确是登录失效」的情况，越稳妥越好。
+_AUTH_FAIL_KW = ("token", "失效", "过期", "未登录", "重新登录", "重新登陆",
+                "登录已", "未授权", "unauthorized", "please login",
+                "auth fail", "auth expired", "login expired")
+
+
+def _detect_auth_failure(data):
+    """识别 139 个人云接口的登录失效响应，命中则抛 TokenExpired。
+    网络层错误（_error / _raw）不属于认证失效，不在此处理，交由调用方判断。
+    """
+    if not isinstance(data, dict):
+        return
+    if data.get("_error") is not None or data.get("_raw") is not None:
+        return
+    code = str(data.get("code") or data.get("errorCode") or data.get("resultCode") or "")
+    msg = str(data.get("message") or data.get("desc") or data.get("errorMsg")
+              or data.get("resultDesc") or "")
+    if code in _AUTH_FAIL_CODES:
+        raise TokenExpired("登录已失效（code=%s）：%s" % (code, msg))
+    low = msg.lower()
+    if any(kw in low for kw in _AUTH_FAIL_KW):
+        raise TokenExpired("登录已失效：%s" % msg)
+    if data.get("success") is False and any(kw in low for kw in _AUTH_FAIL_KW):
+        raise TokenExpired("登录已失效：%s" % msg)
+
+
+# ============================ 网络瞬断判定与重试 ============================
+# [8.0.1] 跨设备/跨服务器通用：不同部署环境的网络抖动来源不同——
+#   Linux 系统 DNS 瞬断（Name or service not known）、Windows 解析器超时、
+#   Docker 容器内 DNS 上游重启（Temporary failure in name resolution）、
+#   服务器出网抖动（Connection reset / timed out）、代理断流等。
+# 这类问题都是「等几秒就好」，不该把监控项直接打成 error 让人手动点重扫，
+# 更不该在转存中途失败造成半截状态。因此：请求层统一做短退避重试，
+# 仍失败时抛出可识别的网络异常，供上层区分「网络问题」与「链接/账号问题」。
+import socket as _socket
+
+_CONN_ERRNOS = {101, 102, 103, 104, 110, 111, 113}  # Linux/通用：ECONNRESET/ECONNABORTED/ECONNREFUSED/EHOSTUNREACH/ETIMEDOUT/EHOSTDOWN
+
+
+class NetworkError(RuntimeError):
+    """网络层错误（DNS 解析失败 / 连接中断 / 超时 / 出网不通）。
+
+    与业务错误区分开的关键：这类错误重试即可，不代表链接失效或账号异常，
+    上层应保持监控项原状态、下轮自动重试，而不是标记为 error 让人手动干预。
+    """
+    pass
+
+
+def is_network_error(e):
+    """判断异常是否为「网络瞬断」类。已覆盖 urllib/http/socket/ssl 各层包装。"""
+    if isinstance(e, (NetworkError, _socket.gaierror, _socket.timeout)):
+        return True
+    seen, cur = set(), e
+    for _ in range(6):  # 逐层拆包：urllib.error.URLError.reason 里才是真正的 socket 异常
+        if cur is None or id(cur) in seen:
+            break
+        seen.add(id(cur))
+        if isinstance(cur, (_socket.gaierror, _socket.timeout, ConnectionError, TimeoutError)):
+            return True
+        errno = getattr(cur, "errno", None)
+        if isinstance(errno, int) and errno in _CONN_ERRNOS:
+            return True
+        if getattr(cur, "errno", None) in (-2, -3, 11001, 11002):  # getaddrinfo 失败码（含 Windows）
+            return True
+        low = str(cur).lower()
+        for kw in ("name or service not known", "temporary failure in name resolution",
+                   "nodename nor servname", "getaddrinfo failed", "no address associated",
+                   "connection reset", "connection aborted", "connection refused",
+                   "timed out", "timeout", "network is unreachable", "no route to host",
+                   "remote end closed", "eof occurred", "broken pipe", "ssl", "certificate"):
+            if kw in low:
+                return True
+        cur = getattr(cur, "reason", None) or getattr(cur, "__cause__", None) \
+            or getattr(cur, "__context__", None) or getattr(cur, "__original_error__", None)
+    return False
+
+
+def http_json(url, body_str, headers, timeout=30, retries=3):
+    """带退避重试的 JSON POST。
+
+    返回 (解析后的对象 或 None, 原始文本)。网络瞬断时自动重试（0.8s/2.4s/5s 递增退避，
+    总耗时可控），重试用尽仍未通则抛 NetworkError——由上层决定如何降级。
+    非 2xx 的 HTTP 响应（含 4xx/5xx）一律原样返回文本，交给业务层判错，
+    不在这里重试（业务错误重试无意义，且会放大服务端压力）。
+    """
+    body = body_str.encode("utf-8")
+    last = None
+    for attempt in range(max(1, retries)):
+        try:
+            req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8", "replace")
+            try:
+                return json.loads(raw), raw
+            except Exception:
+                return None, raw
+        except urllib.error.HTTPError as e:
+            # 服务端已回话（4xx/5xx），属于业务/服务端问题，不重试
+            try:
+                raw = e.read().decode("utf-8", "replace")
+            except Exception:
+                raw = ""
+            return None, (raw or '{"_http_status": %d}' % e.code)
+        except Exception as e:
+            last = e
+            if not is_network_error(e) or attempt >= retries - 1:
+                break
+            try:
+                time.sleep(0.8 * (3 ** attempt))
+            except Exception:
+                pass
+    if last is not None and is_network_error(last):
+        raise NetworkError(_friendly_net_msg(url, last))
+    raise last if last is not None else NetworkError("请求失败：%s" % url)
+
+
+def _friendly_net_msg(url, e):
+    """把底层网络错误翻译成人能看懂的提示，便于不同环境下的用户自助判断。"""
+    host = ""
+    try:
+        host = url.split("://", 1)[-1].split("/", 1)[0]
+    except Exception:
+        pass
+    low = str(e).lower()
+    if "name or service not known" in low or "name resolution" in low \
+            or "-2" in low or "nodename nor servname" in low or "getaddrinfo" in low:
+        return ("网络异常：域名 %s 解析失败（本机 DNS 暂时不可用，已自动重试仍失败）。"
+                "通常几十秒后自行恢复；若持续出现，请检查本机/容器的 DNS 配置。" % host)
+    return "网络异常：连接 %s 失败（%s），已自动重试仍失败，稍后会自动再次尝试。" % (host, str(e)[:160])
+
+
+# ============================ 139 云盘客户端 ============================
+class Yun139:
+    # 路由策略接口（host 固定）
+    ROUTE_HOST = "https://user-njs.yun.139.com"
+    ROUTE_PATH = "/user/route/qryRoutePolicy"
+
+    def __init__(self, authorization: str):
+        # 用户粘贴的可能是 "Basic xxxx" 或纯 "xxxx"，统一剥离 Basic 前缀，存纯 base64
+        auth = (authorization or "").strip()
+        if auth.lower().startswith("basic "):
+            auth = auth[6:].strip()
+        self.token = auth
+        self.host = None          # 真实个人云 host，调路由策略后填入
+        self.all_modules = []     # 路由策略返回的全部模块 (modName, httpsUrl)
+        self.prefer_module = None # 可选：强制使用的模块名（如 "personal_new"）
+        self.account = self._decode_account()
+
+        # 公共请求头（大小写无所谓，值是关键）
+        self.common_headers = {
+            "Accept": "application/json, text/plain, */*",
+            "Content-Type": "application/json;charset=UTF-8",
+            "Authorization": "Basic " + self.token,
+            "Cms-Device": "default",
+            "Mcloud-Channel": "1000101",
+            "Mcloud-Client": "10701",
+            "Mcloud-Version": "7.14.0",
+            "x-DeviceInfo": "||9|7.14.0|chrome|120.0.0.0|||windows 10||zh-CN|||",
+            "x-huawei-channelSrc": "10000034",
+            "x-inner-ntwk": "2",
+            "x-m4c-caller": "PC",
+            "x-m4c-src": "10002",
+            "x-SvcType": "1",
+        }
+        # 路由策略接口专用头
+        self.route_headers = dict(self.common_headers)
+        self.route_headers.update({
+            "mcloud-client": "10701",
+            "Origin": "https://yun.139.com",
+            "Referer": "https://yun.139.com/w/",
+            "x-inner-ntwk": "2",
+            "Inner-Hcy-Router-Https": "1",
+        })
+        # 个人云 /file/* 接口专用头
+        self.personal_headers = dict(self.common_headers)
+        self.personal_headers.update({
+            "Caller": "web",
+            "Mcloud-Route": "001",
+            "X-Yun-Api-Version": "v1",
+            "X-Yun-App-Channel": "10000034",
+            "X-Yun-Channel-Source": "10000034",
+            "X-Yun-Client-Info": "||9|7.14.0|chrome|120.0.0.0|||windows 10||zh-CN|||dW5kZWZpbmVk||",
+            "X-Yun-Module-Type": "100",
+            "X-Yun-Svc-Type": "1",
+        })
+
+    # ---------- 账号解析（用于路由策略的 accountName） ----------
+    def _decode_account(self):
+        try:
+            raw = base64.b64decode(self.token + "==="[:(-len(self.token)) % 4])
+            parts = raw.decode("utf-8", "replace").split(":")
+            if len(parts) >= 3:
+                return parts[1]          # 格式通常为 A:B(账号):C|D|E|F
+        except Exception:
+            pass
+        return ""
+
+    # ---------- 底层：带签名的请求 ----------
+    def _sign_headers(self, base_headers, body_str):
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        rnd = _rand_str(16)
+        sign = cal_sign(body_str, ts, rnd)
+        h = dict(base_headers)
+        h["mcloud-sign"] = f"{ts},{rnd},{sign}"
+        return h
+
+    def _post_json(self, url, base_headers, body):
+        """发送 JSON POST，返回解析后的 dict；非 JSON 时返回 {'_raw': 文本}。"""
+        body_str = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
+        headers = self._sign_headers(base_headers, body_str)
+        # [8.0.1] 走带退避重试的 http_json：DNS 瞬断/连接抖动自动重试，
+        # 重试用尽抛 NetworkError（上层据此区分「网络问题」与「链接/账号问题」）。
+        try:
+            obj, raw = http_json(url, body_str, headers, timeout=30)
+        except NetworkError as e:
+            return {"_error": str(e), "_network": True}
+        if obj is None:
+            return {"_raw": raw[:2000]}
+        return obj
+
+    # ---------- 路由策略：拿真实 host ----------
+    def request_route_policy(self):
+        body = {
+            "userInfo": {
+                "userType": 1,
+                "accountType": 1,
+                "accountName": self.account,
+            },
+            "modAddrType": 1,
+        }
+        resp = self._post_json(self.ROUTE_HOST + self.ROUTE_PATH, self.route_headers, body)
+        if isinstance(resp, dict) and resp.get("_raw") is not None:
+            raise RuntimeError("路由策略返回非JSON(host=%s): %s" % (self.ROUTE_HOST, str(resp["_raw"])[:800]))
+        if isinstance(resp, dict) and resp.get("_error") is not None:
+            # [8.0.1] 网络层失败抛 NetworkError（不是 RuntimeError）：让上层能识别
+            # 「本机/容器 DNS 或出网暂时不通」，保持监控项原状态并下轮自动重试，
+            # 而不是把用户吓成「目录解析失败」需要手动干预。
+            if resp.get("_network"):
+                raise NetworkError(str(resp["_error"])[:800])
+            raise RuntimeError("路由策略请求出错(host=%s): %s" % (self.ROUTE_HOST, str(resp["_error"])[:800]))
+        # 防御：data 可能为 null（接口常返回 {"data": null, "errorCode":..., "errorMsg":...}）
+        data = resp.get("data") if isinstance(resp, dict) else None
+        if not isinstance(data, dict):
+            raise RuntimeError("路由策略返回异常(data 非对象, host=%s): %s"
+                               % (self.ROUTE_HOST, json.dumps(resp, ensure_ascii=False)[:800]))
+        lst = data.get("routePolicyList") or []
+        self.all_modules = [(p.get("modName"), p.get("httpsUrl")) for p in lst]
+        if not lst:
+            raise RuntimeError("路由策略未返回任何模块(host=%s): %s"
+                               % (self.ROUTE_HOST, json.dumps(resp, ensure_ascii=False)[:800]))
+        # 选择模块：prefer_module 优先 > 精确 personal > 包含 personal
+        host = None
+        pref = getattr(self, "prefer_module", None)
+        if pref:
+            for p in lst:
+                if p.get("modName") == pref:
+                    host = p.get("httpsUrl"); break
+        if not host:
+            for p in lst:
+                if p.get("modName") == "personal":
+                    host = p.get("httpsUrl"); break
+        if not host:
+            for p in lst:
+                if "personal" in (p.get("modName") or "").lower():
+                    host = p.get("httpsUrl"); break
+        if not host:
+            # 没匹配到 personal，把全部模块列出来让用户看
+            raise RuntimeError("路由策略里没有 personal 模块，全部模块=" + json.dumps(self.all_modules, ensure_ascii=False)[:600])
+        self.host = host
+        return {"host": self.host}
+
+    def _ensure_host(self):
+        if not self.host:
+            r = self.request_route_policy()
+            if not self.host:
+                raise RuntimeError("无法获取个人云 host：" + json.dumps(r, ensure_ascii=False)[:300])
+        return self.host
+
+    # ---------- 个人云请求封装 ----------
+    def personal_post(self, path, body):
+        host = self._ensure_host()
+        data = self._post_json(host + path, self.personal_headers, body)
+        # 统一在个人云层识别登录失效，命中即抛 TokenExpired，
+        # 上层（app.py 路由 / 监控线程）捕获后提示重登并暂停。
+        _detect_auth_failure(data)
+        return data
+
+    # ---------- 字段归一化（兼容多种命名） ----------
+    @staticmethod
+    def _is_folder(it):
+        t = (it.get("type") or it.get("fileType") or it.get("contentType") or "").lower()
+        return t in ("folder", "dir")
+
+    @staticmethod
+    def _name(it):
+        return it.get("name") or it.get("fileName") or it.get("contentName") or ""
+
+    @staticmethod
+    def _fid(it):
+        return it.get("fileId") or it.get("contentID") or it.get("id") or ""
+
+    @staticmethod
+    def _size(it):
+        return it.get("size") or it.get("fileSize") or it.get("contentSize") or 0
+
+    # ---------- 目录遍历（POST {host}/file/list） ----------
+    def list_dir(self, parent, cursor=None):
+        if not parent or parent in ("root", "/"):
+            parent = "/"           # 个人云根目录 parentFileId 用 "/"
+        body = {
+            "imageThumbnailStyleList": ["Small", "Large"],
+            "orderBy": "updated_at",
+            "orderDirection": "DESC",
+            "pageInfo": {"pageCursor": cursor or "", "pageSize": 100},
+            "parentFileId": parent,
+        }
+        data = self.personal_post("/file/list", body)
+        # 非 JSON / 请求异常：直接抛出来看原文
+        if isinstance(data, dict) and data.get("_raw") is not None:
+            raise RuntimeError("列出文件返回非JSON(host=%s): %s" % (self.host, str(data["_raw"])[:600]))
+        if isinstance(data, dict) and data.get("_error") is not None:
+            raise RuntimeError("列出文件请求出错(host=%s): %s" % (self.host, str(data["_error"])[:600]))
+        # 防御：data 可能为 null
+        d = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(d, dict):
+            d = {}
+        items = (d.get("items") or d.get("Items")
+                 or (data.get("items") if isinstance(data, dict) else None)
+                 or (data.get("Items") if isinstance(data, dict) else None) or [])
+        nxt = (d.get("nextPageCursor")
+               or (data.get("nextPageCursor") if isinstance(data, dict) else None) or None)
+        # 若 139 明确返回失败，把原文抛出来便于诊断
+        if isinstance(data, dict) and data.get("success") is False:
+            msg = (data.get("message") or data.get("resultDesc") or data.get("desc")
+                   or data.get("code") or "")
+            raise RuntimeError("列出文件被拒绝(host=%s, msg=%s) 原文=%s"
+                               % (self.host, msg, json.dumps(data, ensure_ascii=False)[:600]))
+        return items, nxt, data
+
+    def iter_all(self, root, max_depth=20):
+        stack = [(root, 0)]
+        while stack:
+            parent, depth = stack.pop()
+            if depth > max_depth:
+                continue
+            cursor = None
+            while True:
+                items, cursor, _ = self.list_dir(parent, cursor)
+                if not items:
+                    break
+                for it in items:
+                    # 把"当前所在文件夹的 fileId"注入给每个文件，作为 .cas 的父目录。
+                    # 这是真正的文件夹 ID（folder fileId），file/create 的 parentFileId 必须是它，
+                    # 不能错用文件自己的 fileId，否则 139 报 00010002 请求参数不合法。
+                    rec = dict(it)
+                    rec["_parent"] = parent
+                    yield rec
+                    if self._is_folder(it):
+                        stack.append((self._fid(it), depth + 1))
+                if not cursor:
+                    break
+
+    # ---------- 创建后回查：确认文件真的出现在列表里 ----------
+    def _verify_file(self, parent, file_id):
+        """创建文件后，立即重新列举该目录，确认 fileId 是否真的出现。
+        用于发现『接口返回成功但文件不显示』的空间/路径错位问题。"""
+        if not file_id:
+            return False
+        try:
+            items, _, _ = self.list_dir(parent)
+        except Exception:
+            return "verify_error"
+        for it in items:
+            if self._fid(it) == file_id:
+                return True
+        return False
+
+    # ---------- CAS 核心：哈希与种子 ----------
+    @staticmethod
+    def sha256_of(item):
+        """从列表/详情里尽量取出 sha256。139 列表项未必带哈希，需真机确认。"""
+        alg = (item.get("contentHashAlgorithm") or item.get("sha256Algorithm") or "").lower()
+        h = item.get("contentHash") or item.get("sha256") or item.get("sha256Hash") or ""
+        if alg == "sha256" and len(h) == 64:
+            return h.lower()
+        # 若字段直接叫 sha256 且长度 64
+        if len(h) == 64 and all(c in "0123456789abcdef" for c in h.lower()):
+            return h.lower()
+        return None
+
+    @staticmethod
+    def build_cas(name, size, sha256, md5="", parent_file_id=""):
+        payload = {
+            "provider": "139",
+            "name": name,
+            "size": size,
+            "md5": md5,
+            "sliceMd5": md5 or "",
+            "sha1": "",
+            "preID": "",
+            "sha256": sha256,
+            "parentFileId": parent_file_id,
+            "create_time": str(int(time.time())),
+        }
+        return base64.b64encode(json.dumps(payload, ensure_ascii=False).encode()).decode()
+
+    # ---------- [6.1.5] 实时查重：parent 目录里是否已存在名为 name 的文件 ----------
+    def _cas_exists(self, parent, name):
+        """生成 CAS 前实时问 139 一次：目标目录里是不是已经有这个 cas 了。
+        用实时查询而非启动快照，才能挡住「并发/不同 root 路径指向同一文件夹」造成的漏判。"""
+        try:
+            pid = parent if parent not in ("root", "/", "") else "/"
+            cursor = None
+            while True:
+                items, cursor, _ = self.list_dir(pid, cursor)
+                for it in (items or []):
+                    if not self._is_folder(it) and self._name(it) == name:
+                        return True
+                if not cursor:
+                    break
+        except Exception:
+            pass
+        return False
+
+    # ---------- 上传 cas 小文件（已对齐光鸭版 OpenList 139 驱动：file/create → PUT → /file/complete） ----------
+    def upload_cas(self, cas_name, content, parent):
+        """把 .cas 种子文件真实上传到 139 云盘（三步，缺一不可）：
+           1) POST /file/create 预上传，拿到 fileId / uploadId / partInfos[].uploadUrl
+           2) PUT 内容到 uploadUrl
+           3) POST /file/complete 提交完成 —— 139 必须走完这步文件才会真正显示在云盘
+        """
+        # [6.1.5] 最后一道防线：若目标目录已有同名 cas，直接跳过、绝不调 /file/create，
+        # 避免 139 的 auto_rename 把同名文件另存成 "name (1).cas" 副本。
+        try:
+            if self._cas_exists(parent, cas_name):
+                return {"_file_id": None, "_exist": True, "skipped": True, "name": cas_name}
+        except Exception:
+            pass
+        raw = content.encode("utf-8")
+        size = len(raw)
+        content_sha256 = hashlib.sha256(raw).hexdigest()
+        body = {
+            "contentHash": content_sha256,
+            "contentHashAlgorithm": "SHA256",
+            "contentType": "application/octet-stream",
+            "parallelUpload": False,
+            "partInfos": [{"partNumber": 1, "partSize": size, "parallelHashCtx": {"partOffset": 0}}],
+            "size": size,
+            "parentFileId": parent if parent not in ("root", "/", "") else "/",
+            "name": cas_name,
+            "type": "file",
+            "fileRenameMode": "auto_rename",  # 139 仅接受 auto_rename/force_rename/省略；overwrite 会被拒(04000002)
+        }
+        resp = self.personal_post("/file/create", body)
+        if isinstance(resp, dict) and (resp.get("_raw") is not None or resp.get("_error") is not None):
+            resp["_create_failed"] = True
+            return resp
+        d = resp.get("data") if isinstance(resp, dict) else None
+        if not isinstance(d, dict):
+            resp["_create_failed"] = True
+            resp["_no_data"] = True
+            return resp
+        file_id = d.get("fileId") or resp.get("fileId")
+        upload_id = d.get("uploadId") or resp.get("uploadId")
+        exist = d.get("exist") or d.get("rapidUpload")
+        if exist and file_id:
+            # 秒传命中（cas 是全新文件一般不会命中，保留兼容）
+            resp["_file_id"] = file_id
+            resp["_exist"] = True
+            return resp
+        # 真实上传：取分片上传地址
+        part_infos = d.get("partInfos") or []
+        upload_url = None
+        for p in part_infos:
+            upload_url = p.get("uploadUrl") or p.get("uploadUrl")
+            if upload_url:
+                break
+        if not upload_url:
+            resp["_missing_upload_url"] = True
+            return resp
+        # 2) PUT 内容到上传地址
+        try:
+            req = urllib.request.Request(upload_url, data=raw, headers={
+                "Content-Type": "application/octet-stream",
+                "Content-Length": str(size),
+                "Origin": "https://yun.139.com",
+                "Referer": "https://yun.139.com/",
+            }, method="PUT")
+            urllib.request.urlopen(req, timeout=60).read()
+        except Exception as e:
+            resp["_upload_error"] = str(e)
+            resp["_file_id"] = file_id
+            return resp
+        # 3) 完成上传 commit —— 139 必须这一步，文件才会真正显示
+        if file_id and upload_id:
+            try:
+                comp = self.personal_post("/file/complete", {
+                    "contentHash": content_sha256,
+                    "contentHashAlgorithm": "SHA256",
+                    "fileId": file_id,
+                    "uploadId": upload_id,
+                })
+                resp["_complete"] = comp
+            except Exception as e:
+                resp["_complete_error"] = str(e)
+        # 回查确认文件真的出现（二次保险）
+        if file_id:
+            try:
+                resp["_verify_found"] = self._verify_file(parent, file_id)
+            except Exception:
+                resp["_verify_found"] = "verify_error"
+        resp["_file_id"] = file_id
+        resp["_upload_id"] = upload_id
+        return resp
+
+    # ---------- 恢复（按 sha256 秒传，未实测） ----------
+    def restore(self, sha256, size, name, parent):
+        body = {
+            "contentHash": sha256,
+            "contentHashAlgorithm": "SHA256",
+            "contentType": "application/octet-stream",
+            "parallelUpload": False,
+            "partInfos": [{"partNumber": 1, "partSize": size}],
+            "size": size,
+            "parentFileId": parent if parent not in ("root", "/", "") else "/",
+            "name": name,
+            "type": "file",
+            "fileRenameMode": "auto_rename",
+        }
+        resp = self.personal_post("/file/create", body)
+        d = resp.get("data") if isinstance(resp, dict) else None
+        fid = resp.get("fileId") or (d.get("fileId") if isinstance(d, dict) else None)
+        if fid:
+            try:
+                resp["_verify_found"] = self._verify_file(parent, fid)
+            except Exception:
+                resp["_verify_found"] = "verify_error"
+        return resp
+
+    # ---------- 删除（进回收站，未实测） ----------
+    def delete(self, file_ids):
+        if not file_ids:
+            return {}
+        return self.personal_post("/recyclebin/batchTrash", {"fileIds": file_ids})
+
+    # ---------- 高层动作（给网页用） ----------
+    def plan(self, root):
+        ok, skip, sample = [], [], None
+        for it in self.iter_all(root):
+            if self._is_folder(it):
+                continue
+            name = self._name(it)
+            ext = ("." + name.rsplit(".", 1)[-1].lower()) if "." in name else ""
+            sha = self.sha256_of(it)
+            parent = it.get("_parent") or it.get("parentFileId") or it.get("parentId") or root
+            if sha and ext in CAS_EXT:
+                # 必须带上 sha256 与 parent：前端「恢复播放」调用 restore 时需要这两个字段，
+                # 之前 plan 只返回 name/size，导致 x.sha256 / x.parent 为 undefined，
+                # 后端 restore 因缺参直接报错——恢复播放功能是坏的。
+                ok.append({"name": name, "size": self._size(it),
+                           "sha256": sha, "parent": parent, "fileId": self._fid(it)})
+            else:
+                # 无 sha256（云端列表未返回哈希，转不了）或扩展名不在 CAS_EXT（非视频/非镜像），归入跳过。
+                skip.append({"name": name,
+                             "reason": "no_sha256" if not sha else "unsupported_ext"})
+            if sample is None:
+                sample = it        # 留一个原始样本，供前端展示真实字段
+        return ok, skip, sample
+
+    def generate(self, root, delete_source=False, progress=None, on_phase=None):
+        """把原视频 / 光盘镜像（ISO/IMG 等）转成几 KB 的 .cas 文件，直接上传到 139 云盘的【原文件夹】里。
+        .cas 只是一颗种子：含原文件的 sha256 哈希。恢复时靠这颗种子做秒传，把原文件在云盘复活。
+        可转换的扩展名见模块级 CAS_EXT（视频 + ISO/IMG/M2TS，可用 CASGEN_EXTS 环境变量追加）。
+        上传走完整三步（file/create → PUT → /file/complete），确保 .cas 真实显示在云盘，供光鸭版 OpenList 挂载播放。
+        progress: 可选回调，每处理一个文件调用 progress(已处理数)，用于前端显示进度。
+        on_phase: 可选回调，阶段切换时调用 on_phase(阶段名, 信息dict)，用于前端分步提示。
+                  阶段名: generating(开始生成CAS) / deleting(开始删除原视频) / done(全部完成)。"""
+        def _phase(ph, **kw):
+            if callable(on_phase):
+                try:
+                    on_phase(ph, kw)
+                except Exception:
+                    pass
+        # [6.1.5] 同一目标目录串行化：避免「手动连点 / 一条龙后台线程 / 链接监控扫描」并发触发时，
+        # 各自在启动瞬间拍快照、都以为 cas 还没生成、于是都去上传，最终被 139 的 auto_rename 另存成副本。
+        _gen_lock = _gen_lock_for(root)
+        _gen_lock.acquire()
+        try:
+            results = []
+            to_delete = []
+            processed = 0
+            # 收集目录下已有文件名（幂等用）：按"所在文件夹"分别记录，已存在同名 .cas 则跳过。
+            # 必须按目录判定，不能用全局集合——不同影视剧常有同名剧集（都叫"第5集 4K.mkv"），
+            # 全局集合会误把别的剧集目录里的 .cas 也算进来，导致本剧集视频被错判"已存在"而不生成 .cas。
+            # [6.1.5] 这份快照只防「本目录内本就已有的 cas」；并发安全交给上面的 _gen_lock，
+            # 而「刚被别的线程 / 上一次跑刚落地」的 cas 由下方上传前的 _cas_exists 实时兜底。
+            all_items = list(self.iter_all(root))
+            existing = {}  # parent_id -> set(文件名)
+            for it in all_items:
+                if not self._is_folder(it):
+                    pid = it.get("_parent") or it.get("parentFileId") or it.get("parentId") or root
+                    existing.setdefault(pid, set()).add(self._name(it))
+            # 统计需生成的视频总数，用于阶段提示（不处理 .cas 与非视频）
+            video_total = 0
+            for it in all_items:
+                if self._is_folder(it):
+                    continue
+                nm = self._name(it)
+                ext = ("." + nm.rsplit(".", 1)[-1].lower()) if "." in nm else ""
+                if ext == ".cas":
+                    continue
+                if ext in CAS_EXT:
+                    video_total += 1
+            _phase("generating", total=video_total)
+            for it in all_items:
+                processed += 1
+                if callable(progress):
+                    try:
+                        progress(processed)
+                    except Exception:
+                        pass
+                if self._is_folder(it):
+                    continue
+                name = self._name(it)
+                # [2.0 修复] 只转 CAS_EXT 白名单（视频+光盘镜像），跳过 .cas（根治后缀叠加）/ 非支持类型
+                ext = ("." + name.rsplit(".", 1)[-1].lower()) if "." in name else ""
+                if ext == ".cas":
+                    results.append({"name": name, "status": "skipped_cas"})
+                    continue
+                if ext not in CAS_EXT:
+                    results.append({"name": name, "status": "skipped_non_video"})
+                    continue
+                sha = self.sha256_of(it)
+                if not sha:
+                    results.append({"name": name, "status": "skipped_no_sha256"})
+                    continue
+                # 父目录必须是文件夹 fileId：优先用 iter_all 注入的 _parent（当前所在文件夹），
+                # 再退而求其次用 139 列表项自带的 parentFileId / parentId；最后退回 root。
+                # 注意：绝不能用 self._fid(it)（那是文件自己的 ID），否则 file/create 报 00010002。
+                parent = it.get("_parent") or it.get("parentFileId") or it.get("parentId") or root
+                # cas 文件名 = 原文件名.cas（贴合光鸭版 OpenList 约定：靠文件名/内容还原原文件）
+                cas_name = name + ".cas"
+                # [6.1.5] 双重去重：① 启动快照里已有同名 cas → 跳过；
+                #         ② 实时问 139 一遍（upload_cas 内部还会再查一次兜底），挡住并发 / 刚落地的情况。
+                if cas_name in existing.get(parent, set()) or self._cas_exists(parent, cas_name):
+                    # CAS 已存在：跳过重新生成（幂等）。但若开启了删除原视频，
+                    # 仍要把原视频加入待删除列表——否则会出现"CAS 有了、原视频却没删"的残留。
+                    results.append({"name": cas_name, "status": "skipped_exists",
+                                    "delete_scheduled": bool(delete_source)})
+                    if delete_source:
+                        to_delete.append(self._fid(it))
+                    continue
+                content = self.build_cas(name, self._size(it), sha, it.get("contentHash", ""), parent)
+                try:
+                    up = self.upload_cas(cas_name, content, parent)
+                    if up.get("skipped"):
+                        # [6.1.5] upload_cas 内部实时查重发现已存在，直接跳过（绝不造副本）。
+                        results.append({"name": cas_name, "status": "skipped_exists",
+                                        "delete_scheduled": bool(delete_source)})
+                        if delete_source:
+                            to_delete.append(self._fid(it))
+                        continue
+                    fid = up.get("_file_id") or up.get("fileId") or (up.get("data") or {}).get("fileId")
+                    up_ok = bool(fid) and not up.get("_upload_error") and not up.get("_complete_error")
+                    status = "uploaded" if up_ok else "upload_failed"
+                    detail = {k: up.get(k) for k in (
+                        "_upload_error", "_complete_error", "_missing_upload_url",
+                        "_create_failed", "_no_data", "_exist"
+                    ) if up.get(k) is not None}
+                    err = (up.get("error") or up.get("_upload_error") or up.get("_complete_error")
+                           or up.get("message") or (up.get("data") or {}).get("message")
+                           or up.get("code"))
+                    results.append({
+                        "name": cas_name,
+                        "status": status,
+                        "sha256": sha,
+                        "size": self._size(it),
+                        "parent": parent,
+                        "fileId": fid,
+                        "verify_found": up.get("_verify_found"),
+                        "error": err,
+                        "detail": detail,
+                    })
+                except Exception as e:
+                    results.append({"name": cas_name, "status": "upload_failed", "error": str(e)})
+                if delete_source:
+                    to_delete.append(self._fid(it))
+            if delete_source and to_delete:
+                _phase("deleting", count=len(to_delete))
+                dresp = self.delete(to_delete)
+                results.append({"name": f"[已删除 {len(to_delete)} 个原视频]", "status": "deleted", "deletedCount": len(to_delete), "detail": dresp})
+            _phase("done", total=len(results))
+            return results
+        finally:
+            _gen_lock.release()
+
+    # ---------- [2.0] 分享转存：目标目录解析 ----------
+    def find_or_create_folder(self, name, parent="root"):
+        """在 parent 下找同名文件夹，没有就创建，返回其 catalogID（未实测，需真机验证）。"""
+        items, _, _ = self.list_dir(parent)
+        for it in items:
+            if self._is_folder(it) and self._name(it) == name:
+                return self._fid(it)
+        body = {
+            "parentFileId": parent if parent not in ("root", "/") else "/",
+            "name": name,
+            "type": "folder",
+            # 文件夹创建仅接受 force_rename/省略（auto_rename 对目录报 04000002 目录类型不支持当前命名模式）；
+            # 原 overwrite 同样被拒→新建子目录返回 None→转存落根目录
+            "fileRenameMode": "force_rename",
+        }
+        d = self.personal_post("/file/create", body)
+        dd = d.get("data") if isinstance(d, dict) else None
+        return (dd or {}).get("fileId") or d.get("fileId")
+
+    def resolve_folder(self, target):
+        """把用户输入的目录名/路径（如 '分享转存' 或 '/电影/分享'）解析成 catalogID。
+        空或 root 返回 'root'；多级路径逐级 find_or_create。"""
+        target = (target or "").strip()
+        if not target or target in ("root", "/"):
+            return "root"
+        cur = "root"
+        for part in [t for t in target.split("/") if t]:
+            cur = self.find_or_create_folder(part, cur)
+        return cur
+
+    # ======================== [4.0] CAS→Strm 播放网关支持 ========================
+    # 对齐光鸭版 OpenList 139 驱动（drivers/139/cas.go 的 linkCASVideo）：
+    #   读 .cas -> 139 秒传临时恢复 -> personalGetLink 拿直链 -> 异步删临时文件
+    # 139 各接口按 OpenList 官方 139 驱动 + 52pojie 逆向实现，【真机未实测，待用户试跑微调】。
+    CAS_TEMP_DIR = "TEMP"
+
+    def ensure_temp_dir(self):
+        """在根目录建/找 TEMP 文件夹，用于临时恢复 .cas 对应的真实文件（恢复后异步删除，保住省空间）。"""
+        items, _, _ = self.list_dir("root")
+        for it in items:
+            if self._is_folder(it) and self._name(it) == self.CAS_TEMP_DIR:
+                return self._fid(it)
+        body = {"parentFileId": "/", "name": self.CAS_TEMP_DIR,
+                "type": "folder", "fileRenameMode": "force_rename"}
+        d = self.personal_post("/file/create", body)
+        dd = d.get("data") if isinstance(d, dict) else None
+        return (dd or {}).get("fileId") or d.get("fileId")
+
+    def get_download_link(self, file_id):
+        """对齐 OpenList 139 驱动 personalGetLink：POST /file/getDownloadUrl -> data.cdnUrl/data.url。
+        返回可直接拉流的直链（播放器 302 直连，不耗 casgen 带宽）。"""
+        host = self._ensure_host()
+        data = self._post_json(host + "/file/getDownloadUrl", self.personal_headers, {"fileId": file_id})
+        _detect_auth_failure(data)  # 保持登录失效检测（触发前端重登）
+        if isinstance(data, dict):
+            d = data.get("data") or {}
+            url = d.get("cdnUrl") or d.get("url")
+            if url:
+                return url
+        raise Exception("139 获取下载直链失败: %r" % (data,))
+
+    def read_file_text(self, file_id):
+        """下载小文件（如 .cas 文本）内容。139 直链需带 Authorization Cookie，否则 403/认证失败。"""
+        url = self.get_download_link(file_id)
+        req = urllib.request.Request(url, headers={
+            "Referer": "https://yun.139.com/",
+            "User-Agent": "Mozilla/5.0",
+            "Cookie": "Authorization=Basic " + self.token,
+        })
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.read().decode("utf-8", "replace")
+
+    def cas_get_play_link(self, cas_file_id, cas_name):
+        """核心：给定 .cas 的 file_id + 文件名，返回 (直链URL, 临时恢复的file_id)。
+        调用方拿到 URL 后 302 给播放器，并负责异步删除临时 file_id。"""
+        text = self.read_file_text(cas_file_id)
+        try:
+            payload = json.loads(base64.b64decode(text.strip()))
+        except Exception as e:
+            raise Exception("解析 .cas 失败（不是合法的 casgen .cas）: %s" % e)
+        sha256 = payload.get("sha256", "")
+        size = payload.get("size", 0)
+        name = payload.get("name") or (cas_name[:-4] if cas_name.endswith(".cas") else cas_name)
+        if not sha256:
+            raise Exception(".cas 缺少 sha256，无法秒传恢复")
+        temp_dir = self.ensure_temp_dir()
+        temp_name = "TEMP_%d_%s" % (int(time.time() * 1000), name)
+        # 临时恢复（auto_rename 避免冲突；恢复的是云盘里的临时文件，稍后删除）
+        resp = self.restore(sha256, size, temp_name, temp_dir)
+        temp_fid = (resp.get("_file_id") or resp.get("fileId")
+                    or (resp.get("data") or {}).get("fileId"))
+        if not temp_fid:
+            raise Exception("139 秒传恢复失败（云端去重池可能无此源）: %r" % (resp,))
+        url = self.get_download_link(temp_fid)
+        return url, temp_fid
+
+    def resolve_path_readonly(self, path):
+        """只读把 139 相对路径（如 电影/流浪地球2/流浪地球2.cas）解析为 file_id。不创建文件夹。"""
+        path = (path or "").strip().strip("/")
+        if not path:
+            return "root"
+        parts = [p for p in path.split("/") if p]
+        cur = "root"
+        for part in parts[:-1]:
+            cur = self._find_folder_readonly(part, cur)
+        return self._find_file_readonly(parts[-1], cur)
+
+    def _find_folder_readonly(self, name, parent):
+        items, _, _ = self.list_dir(parent)
+        for it in items:
+            if self._is_folder(it) and self._name(it) == name:
+                return self._fid(it)
+        raise FileNotFoundError("文件夹不存在: %s" % name)
+
+    def _find_file_readonly(self, name, parent):
+        items, _, _ = self.list_dir(parent)
+        for it in items:
+            if not self._is_folder(it) and self._name(it) == name:
+                return self._fid(it)
+        raise FileNotFoundError("文件不存在: %s" % name)
+
+    # ======================== [4.0] .strm 生成器 ========================
+    def walk(self, root, prefix="", _parent=None):
+        """递归遍历 root 下所有文件，yield (相对路径, item)。item 注入 _parent（父目录 fileId）。"""
+        parent_id = _parent if _parent is not None else root
+        cursor = None
+        while True:
+            items, cursor, _ = self.list_dir(root, cursor)
+            if not items:
+                break
+            for it in items:
+                name = self._name(it)
+                rec = dict(it)
+                rec["_parent"] = parent_id
+                if self._is_folder(it):
+                    sub = (prefix + "/" + name) if prefix else name
+                    yield from self.walk(self._fid(it), sub, self._fid(it))
+                else:
+                    rel = (prefix + "/" + name) if prefix else name
+                    yield rel, rec
+            if not cursor:
+                break
+
+    def upload_text_file(self, name, text, parent):
+        """三步上传纯文本文件（如 .strm）到 139：file/create -> PUT -> /file/complete。"""
+        raw = text.encode("utf-8")
+        size = len(raw)
+        content_sha256 = hashlib.sha256(raw).hexdigest()
+        body = {
+            "contentHash": content_sha256,
+            "contentHashAlgorithm": "SHA256",
+            "contentType": "text/plain",
+            "parallelUpload": False,
+            "partInfos": [{"partNumber": 1, "partSize": size}],
+            "size": size,
+            "parentFileId": parent if parent not in ("root", "/", "") else "/",
+            "name": name,
+            "type": "file",
+            # 139 仅接受 auto_rename/force_rename/省略；overwrite 会被拒(04000002)
+            "fileRenameMode": "auto_rename",
+        }
+        resp = self.personal_post("/file/create", body)
+        if isinstance(resp, dict) and (resp.get("_raw") is not None or resp.get("_error") is not None):
+            resp["_create_failed"] = True
+            return resp
+        d = resp.get("data") if isinstance(resp, dict) else None
+        if not isinstance(d, dict):
+            resp["_create_failed"] = True
+            resp["_no_data"] = True
+            return resp
+        file_id = d.get("fileId") or resp.get("fileId")
+        upload_id = d.get("uploadId") or resp.get("uploadId")
+        exist = d.get("exist") or d.get("rapidUpload")
+        if exist and file_id:
+            resp["_file_id"] = file_id
+            resp["_exist"] = True
+            return resp
+        part_infos = d.get("partInfos") or []
+        upload_url = None
+        for p in part_infos:
+            upload_url = p.get("uploadUrl") or p.get("uploadUrl")
+            if upload_url:
+                break
+        if not upload_url:
+            resp["_missing_upload_url"] = True
+            return resp
+        try:
+            req = urllib.request.Request(upload_url, data=raw, headers={
+                "Content-Type": "text/plain",
+                "Content-Length": str(size),
+                "Origin": "https://yun.139.com",
+                "Referer": "https://yun.139.com/",
+            }, method="PUT")
+            urllib.request.urlopen(req, timeout=60).read()
+        except Exception as e:
+            resp["_upload_error"] = str(e)
+            resp["_file_id"] = file_id
+            return resp
+        if file_id and upload_id:
+            try:
+                comp = self.personal_post("/file/complete", {
+                    "contentHash": content_sha256,
+                    "contentHashAlgorithm": "SHA256",
+                    "fileId": file_id,
+                    "uploadId": upload_id,
+                })
+                resp["_complete"] = comp
+            except Exception as e:
+                resp["_complete_error"] = str(e)
+        if file_id:
+            try:
+                resp["_verify_found"] = self._verify_file(parent, file_id)
+            except Exception:
+                resp["_verify_found"] = "verify_error"
+        resp["_file_id"] = file_id
+        resp["_upload_id"] = upload_id
+        return resp
+
+    def generate_strm(self, root, public_url):
+        """遍历 root 下所有 .cas，为每个生成同名 .strm（内容指向 casgen 网关 URL），上传到同目录。
+        public_url 即 CASGEN_PUBLIC_URL（casgen 网关对外可达地址）。"""
+        public_url = (public_url or "").rstrip("/")
+        if not public_url:
+            raise Exception("未配置 CASGEN_PUBLIC_URL（casgen 网关对外地址），无法生成 .strm")
+        results = []
+        for rel, it in self.walk(root):
+            if not rel.lower().endswith(".cas"):
+                continue
+            cas_name = self._name(it)
+            base = cas_name[:-4] if cas_name.endswith(".cas") else cas_name
+            strm_name = base + ".strm"
+            strm_url = "%s/cas/%s" % (public_url, rel)
+            parent = it.get("_parent") or it.get("parentFileId") or it.get("parentId") or root
+            try:
+                up = self.upload_text_file(strm_name, strm_url, parent)
+                fid = (up.get("_file_id") or up.get("fileId")
+                       or (up.get("data") or {}).get("fileId"))
+                ok = bool(fid) and not up.get("_upload_error") and not up.get("_complete_error")
+                results.append({
+                    "name": strm_name,
+                    "status": "uploaded" if ok else "failed",
+                    "url": strm_url,
+                    "error": up.get("_upload_error") or up.get("_complete_error"),
+                })
+            except Exception as e:
+                results.append({"name": strm_name, "status": "failed", "error": str(e)})
+        return results
+
+    # ======================== [4.0] L1 本地正则重命名 ========================
+    def rename_file(self, file_id, new_name):
+        """139 重命名（对齐光鸭版 OpenList 139 驱动 personal_new 分支）：
+        POST /file/update {fileId, name, description:''}。只改显示名，不动内容。
+        【真机未实测，响应字段待确认】。"""
+        resp = self.personal_post("/file/update",
+                                  {"fileId": file_id, "name": new_name, "description": ""})
+        return resp
