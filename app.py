@@ -23,6 +23,8 @@ from share139 import (parse_share_input, get_share_info, list_all_share_files,
 import monitor
 import monitor_store
 import rename
+from yidong_login import (app_login, login_by_cookie, LoginError,
+                           refresh_by_token, auth_expires_at)
 
 CLIENT = None
 PROVIDER = None
@@ -490,12 +492,41 @@ class H(BaseHTTPRequestHandler):
         action = p.get("action")
 
         if action == "login_status":
+            _u = AUTH_META.get("username") or ""
+            _exp = int(AUTH_META.get("expires_at") or 0)
             return self._json({"ok": True, "loggedIn": CLIENT is not None,
-                               "expired": AUTH_EXPIRED, "provider": PROVIDER})
+                               "expired": AUTH_EXPIRED, "provider": PROVIDER,
+                               "autoRefresh": _can_auto_refresh(),
+                               "refreshMode": "token" if AUTH_META.get("token") else (AUTH_META.get("mode") or ""),
+                               "account": (_u[:3] + "****" + _u[-4:]) if len(_u) >= 8 else _u,
+                               "expiresAt": _exp,
+                               "expiresText": time.strftime("%Y-%m-%d %H:%M",
+                                                            time.localtime(_exp / 1000)) if _exp else ""})
 
         if action == "login":
             prov = p.get("provider")
             if prov == "139":
+                # 账号密码模式：自动登录拿 token，并把账号密码存下来供后台定时刷新
+                _u = (p.get("username") or "").strip()
+                _pw = p.get("password") or ""
+                if _u and _pw:
+                    try:
+                        _info = app_login(_u, _pw)
+                    except Exception as _e:
+                        return self._json({"ok": False, "error": "自动登录失败：" + str(_e)}, 400)
+                    p["authorization"] = _info["token"]
+                    _save_auth_full(_info["token"], "139", username=_u, password=_pw,
+                                    expires_at=_info.get("expires_at") or 0, mode="password")
+                _ck = (p.get("cookie") or "").strip()
+                if not (_u and _pw) and _ck:
+                    # Cookie 模式：免密码、免图形验证码，Cookie 有效期内可长期自动续期
+                    try:
+                        _info = login_by_cookie(_ck)
+                    except Exception as _e:
+                        return self._json({"ok": False, "error": "Cookie 登录失败：" + str(_e)}, 400)
+                    p["authorization"] = _info["token"]
+                    _save_auth_full(_info["token"], "139", cookie=_ck, mode="cookie",
+                                    expires_at=_info.get("expires_at") or 0)
                 auth = (p.get("authorization") or "").strip()
                 if not auth:
                     return self._json({"ok": False, "error": "请填?? Authorization ??"}, 400)
@@ -505,7 +536,7 @@ class H(BaseHTTPRequestHandler):
                     CLIENT = c
                     PROVIDER = "139"
                     AUTH_EXPIRED = False
-                    _save_auth(auth, "139")
+                    _save_auth_full(auth, "139", expires_at=auth_expires_at(auth))
                     _invalidate_list_cache()   # 换账号后旧缓存不能再用
                     resp = {"ok": True, "provider": "139",
                             "version": VERSION,
@@ -521,6 +552,13 @@ class H(BaseHTTPRequestHandler):
                     _log_debug("login_error", {"error": str(e)})
                     return self._json({"ok": False, "error": "登录/列举失败: " + str(e)}, 400)
             return self._json({"ok": False, "error": "未知网盘"}, 400)
+
+        # [9.0] 登录态失效且存过账号密码时，先尝试一次自动重登，成功则无感继续
+        if AUTH_EXPIRED and _can_auto_refresh():
+            try:
+                _do_token_refresh()
+            except Exception as e:
+                _log_debug("auto_refresh_on_demand_fail", {"error": repr(e)})
 
         if CLIENT is None:
             return self._json({"ok": False, "error": "请先登录"}, 400)
@@ -956,6 +994,145 @@ class H(BaseHTTPRequestHandler):
         }
 
 
+# ============================ [9.0] 移动云盘 token 自动刷新 ============================
+# 背景：移动云盘只有约 30 天有效期的 sskAccessToken，官方没有 refresh_token 接口，
+# 到期只能拿「账号密码」重新登录换一条新的。casgen 以前只存一段粘贴来的 Authorization，
+# 填一次 Authorization，剩余有效期不足 15 天时调 authTokenRefresh.do 用旧令牌换新令牌，
+# 回写落盘，不需要密码、不需要扫码、不需要 Cookie。本服务完全独立，不读取其他项目。
+# 账号密码 / Cookie 只在刷新失败时兜底；连续失败 3 次停手，等人工重贴一次。
+AUTH_META = {}
+AUTH_META_LOCK = threading.Lock()
+TOKEN_CHECK_INTERVAL = 6 * 3600         # 检查间隔（秒）
+TOKEN_REFRESH_BEFORE = 15 * 24 * 3600  # 剩 15 天就换
+TOKEN_REFRESH_FAIL_LIMIT = 3            # 连续失败上限
+
+
+def _can_auto_refresh():
+    """只填一次令牌就具备自动续期能力：旧令牌换新令牌（authTokenRefresh.do）。"""
+    return bool((AUTH_META.get("token") or "").strip())
+
+
+def _save_auth_full(token, provider, username=None, password=None, expires_at=0,
+                    mode=None, cookie=None):
+    """保存登录凭证（含账号密码 / Cookie，供自动刷新用）。"""
+    with AUTH_META_LOCK:
+        if username is not None:
+            AUTH_META["username"] = username
+        if password is not None:
+            AUTH_META["password"] = password
+        if cookie is not None:
+            AUTH_META["cookie"] = cookie
+        if mode:
+            AUTH_META["mode"] = mode
+            # 两种续期方式互斥，切到哪条就清掉另一条的敏感信息
+            if mode == "cookie":
+                AUTH_META.pop("password", None)
+            elif mode == "password":
+                AUTH_META.pop("cookie", None)
+        if expires_at:
+            AUTH_META["expires_at"] = int(expires_at or 0)
+        AUTH_META["token"] = token
+        AUTH_META["provider"] = provider
+        AUTH_META["updated_at"] = int(time.time())
+        snapshot = dict(AUTH_META)
+    try:
+        with open(AUTH_FILE, "w", encoding="utf-8") as f:
+            json.dump(snapshot, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def _load_auth_meta():
+    """启动时把落盘凭证装进内存（兼容只有 token/provider 的旧文件）。"""
+    a = _load_auth() or {}
+    with AUTH_META_LOCK:
+        AUTH_META.update(a)
+        AUTH_META.setdefault("token", a.get("token") or "")
+        # 旧版落盘文件没有 expires_at，直接从令牌里解出来，定时器才有基准
+        if not AUTH_META.get("expires_at") and AUTH_META.get("token"):
+            AUTH_META["expires_at"] = auth_expires_at(AUTH_META["token"])
+    return a
+
+
+def _token_need_refresh():
+    """是否需要续期：已失效 / CLIENT 丢了 / 剩余不足 15 天（旧令牌换新令牌）。"""
+    if AUTH_EXPIRED or CLIENT is None:
+        return True
+    exp = int(AUTH_META.get("expires_at") or 0)
+    if not exp:
+        return False
+    return exp - int(time.time() * 1000) < TOKEN_REFRESH_BEFORE * 1000
+
+
+def _do_token_refresh():
+    """旧令牌换新令牌；失败才退到已存过的 Cookie / 账号密码兜底。"""
+    global CLIENT, PROVIDER, AUTH_EXPIRED
+    info = None
+    errs = []
+    cur = (AUTH_META.get("token") or "").strip()
+    if cur:
+        try:
+            info = refresh_by_token(cur)
+        except Exception as e:
+            errs.append("令牌续期: %s" % e)
+    if info is None:
+        mode = AUTH_META.get("mode") or ("cookie" if AUTH_META.get("cookie") else "password")
+        try:
+            if mode == "cookie":
+                ck = (AUTH_META.get("cookie") or "").strip()
+                if not ck:
+                    raise LoginError("未保存 Cookie")
+                info = login_by_cookie(ck)
+            else:
+                u = (AUTH_META.get("username") or "").strip()
+                pw = AUTH_META.get("password") or ""
+                if not u or not pw:
+                    raise LoginError("未保存账号密码")
+                info = app_login(u, pw)
+        except Exception as e:
+            errs.append("%s 兜底: %s" % (mode, e))
+    if info is None:
+        return False, "；".join(errs) or "无法自动刷新"
+    c = Yun139(info["token"])
+    c.list_dir("root")          # 立刻验证新 token 真能用
+    CLIENT = c
+    PROVIDER = AUTH_META.get("provider") or "139"
+    AUTH_EXPIRED = False
+    _save_auth_full(info["token"], PROVIDER,
+                    expires_at=info.get("expires_at") or auth_expires_at(info["token"]))
+    _invalidate_list_cache()
+    _log_debug("auto_refresh", {"ok": True, "expires_at": info.get("expires_at")})
+    return True, ""
+
+
+def start_token_refresher():
+    """后台线程：定时检查并自动刷新移动云盘 token。"""
+    def loop():
+        fails = 0
+        first = True
+        while True:
+            if not first:
+                time.sleep(TOKEN_CHECK_INTERVAL)
+            first = False
+            try:
+                if not _can_auto_refresh() or fails >= TOKEN_REFRESH_FAIL_LIMIT:
+                    continue
+                if not _token_need_refresh():
+                    continue
+                ok, err = _do_token_refresh()
+                if ok:
+                    fails = 0
+                else:
+                    fails += 1
+                    _log_debug("auto_refresh_fail", {"count": fails, "error": err})
+            except Exception as e:
+                fails += 1
+                _log_debug("auto_refresh_error", {"count": fails, "error": repr(e)})
+    t = threading.Thread(target=loop, name="token-refresher", daemon=True)
+    t.start()
+    return t
+
+
 def main():
     global CLIENT, PROVIDER, AUTH_EXPIRED
     # 每次启动时清空旧调试日志，避免多轮测试内容混在一??
@@ -964,7 +1141,7 @@ def main():
     except Exception:
         pass
     # 启动即恢复持久化的登录态（3.0 模块一??
-    auth = _load_auth()
+    auth = _load_auth_meta()
     if auth and auth.get("token"):
         try:
             c = Yun139(auth["token"])
@@ -984,6 +1161,7 @@ def main():
     # 启动分享链接监控调度??3.0 模块??/四）
     monitor.bind(sys.modules[__name__])
     monitor.start_scheduler()
+    start_token_refresher()   # [9.0] 定时自动刷新移动云盘 token（有账号密码才生效）
 
     port = int(os.environ.get("PORT", "5000"))
     srv = ThreadingHTTPServer(("0.0.0.0", port), H)

@@ -106,8 +106,17 @@
   <div class="row">
     <label><input type="radio" name="prov" value="139" checked> 移动云盘 (139)</label>
   </div>
-  <label>Authorization 头（从浏览器抓包复制，见 README）</label>
-  <textarea id="auth" rows="3" placeholder="Bearer xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"></textarea>
+  <label>粘贴一次 Authorization 头即可，以后自动续期（不用密码、不用扫码、不用 Cookie）</label>
+  <textarea id="auth" rows="3" placeholder="Basic xxxxxxxx 或直接粘 base64 串"></textarea>
+  <div class="muted" style="font-size:12px;margin:4px 0 10px">剩 15 天时自动用旧令牌换新令牌，新令牌写回本机 casgen_auth.json。下面两项只是令牌彻底失效时的兜底，平时不用填。</div>
+  <details style="margin:6px 0 10px">
+    <summary class="muted" style="font-size:12px;cursor:pointer">备用：账号密码 / 浏览器 Cookie（可不填）</summary>
+    <div class="row">
+      <input id="loginUser" type="text" placeholder="移动云盘手机号" style="flex:1;min-width:180px">
+      <input id="loginPass" type="password" placeholder="登录密码" style="flex:1;min-width:180px">
+    </div>
+    <textarea id="loginCookie" rows="2" placeholder="F12 → Network → 任一 cloud.189.cn 请求 → 请求头 Cookie 整串粘贴"></textarea>
+  </details>
   <button id="loginBtn">登录并加载根目录</button>
   <div id="loginMsg"></div>
 </div>
@@ -543,16 +552,35 @@ document.getElementById("monAddBtn").onclick = async () => {
 document.getElementById("loginBtn").onclick = async () => {
   const prov = document.querySelector('input[name=prov]:checked').value;
   const auth = document.getElementById("auth").value.trim();
+  const uEl = document.getElementById("loginUser");
+  const pEl = document.getElementById("loginPass");
+  const user = uEl ? uEl.value.trim() : "";
+  const pass = pEl ? pEl.value : "";
   const msg = document.getElementById("loginMsg");
   msg.innerHTML = "登录中…";
   try {
-    const r = await api({ action:"login", provider:prov, authorization:auth });
+    const ckEl = document.getElementById("loginCookie");
+    const ck = ckEl ? ckEl.value.trim() : "";
+    const req = { action:"login", provider:prov, authorization:auth };
+    if (user && pass) { req.username = user; req.password = pass; }
+    else if (ck) { req.cookie = ck; }
+    const r = await api(req);
     dbg(r);
     if (r.version) document.getElementById("ver").textContent = "v"+r.version;
     if (!r.ok){ msg.innerHTML = '<span class="err">失败：'+esc(r.error)+'</span>'; return; }
     msg.innerHTML = '<span class="ok">登录成功 ✔ 根目录共 '+(r.count||0)+' 个项目</span> <span class="muted">[程序版本 '+(r.version||document.getElementById("ver").textContent||"未知")+']</span>';
     showAppCards();
-    try { localStorage.setItem("casgen_auth", auth); localStorage.setItem("casgen_prov", prov); } catch(e){}
+    try {
+      if ((user && pass) || ck) {
+        // 密码模式：token 由后端自己续期，前端不再缓存（避免过期 token 覆盖新登录）
+        localStorage.removeItem("casgen_auth");
+        localStorage.setItem("casgen_prov", prov);
+        msg.innerHTML += ' <span class="ok">· 自动续期已开启</span>';
+      } else {
+        localStorage.setItem("casgen_auth", auth);
+        localStorage.setItem("casgen_prov", prov);
+      }
+    } catch(e){}
     state.path = [["root","根目录"]];
     renderCrumb();
     renderFolders(r.root || []);
