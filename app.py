@@ -134,10 +134,6 @@ def _invalidate_list_cache(parent=None):
             _LIST_CACHE.pop(str(parent or "root"), None)
 
 
-# 后台调度器扫描完也会往云盘写东西，但它不经过 HTTP 层，靠这个回调统一作废缓存
-monitor.TARGET_CHANGED_HOOK = _invalidate_list_cache
-
-
 def _migrate_legacy_data():
     """升级到独立数据目录后，把散落在代码目录里的旧数据搬过去，避免升级后登录态/监控清单丢失。"""
     if os.path.abspath(DATA_DIR) == os.path.abspath(ROOT):
@@ -209,13 +205,47 @@ def _count_videos(client, catalog):
         return 0
 
 
+def _landing(client, catalog, names):
+    """在目标目录子树里找「期望落地的文件名」，返回 (已落地名字集合, 已遍历文件数)。
+
+    按名字判断（忽略大小写），与文件体积无关；names 传分享里的 contentName 即可。
+    递归遍历一次，比原来「数字数」更准：同目录本来就有文件时数字永远对不上，
+    会白等满 180 秒——这才是「等待 139 索引更新」卡很久的原因。
+    """
+    want = {}
+    for n in (names or []):
+        if n:
+            want.setdefault(n.lower(), n)
+    found = set()
+    seen = 0
+    if not want:
+        return found, seen
+    root = catalog if catalog not in ("root", "/") else "root"
+    # 广度优先：先扫目标目录本层（转存通常落在这一层），命中一两秒就能判断，
+    # 不用每次都把整棵子树递归扫完（以前那一下就是几十秒，看起来像卡住）。
+    try:
+        for it in client.iter_all(root, max_depth=20, shallow_first=True):
+            if client._is_folder(it):
+                continue
+            seen += 1
+            hit = want.get((client._name(it) or "").lower())
+            if hit:
+                found.add(hit)
+                if len(found) >= len(want):
+                    break
+    except Exception:
+        pass
+    return found, seen
+
+
 def _count_videos_recursive(client, catalog):
     """递归统计目标目录子树(含所有子孙目录)里的视频/光盘镜像数。
 
     与 _count_videos 的区别：这里是递归的。CAS 后台任务需要它来判断「转存的文件
     是否已落地」——保留目录结构时文件落在子目录里，非递归计数永远看不到，会导致
     等待循环卡满超时、CAS 生成被无限期推迟（表现就是「勾了生成CAS却像没生效」）。
-    该扫描只在后台线程跑，不阻塞浏览器，可接受其递归成本。"""
+    该扫描只在后台线程跑，不阻塞浏览器，可接受其递归成本。
+    ⚠️ 仅用于兜底：一条龙会给期望文件名，用 _landing 按名字判断更准也更快。"""
     try:
         n = 0
         root = catalog if catalog not in ("root", "/") else "root"
@@ -299,8 +329,12 @@ def _wait_transfer_landed(client, target_catalog, names, timeout=300, interval=5
     return False
 
 
-def _run_cas_job(job_id, client, target_catalog, delete_source, expected=0, pre_count=0, on_phase=None):
-    """后台线程：等 139 索引延迟过后，对转存后的目录生成 CAS。进度写? CAS_JOBS[job_id]，前端轮询。"""
+def _run_cas_job(job_id, client, target_catalog, delete_source, expected=0, pre_count=0, on_phase=None,
+                 want_names=None):
+    """后台线程：等 139 索引延迟过后，对转存后的目录生成 CAS。进度写 CAS_JOBS[job_id]，前端轮询。
+
+    want_names：本次转存期望落地的文件名（分享里的 contentName）。给了就按「名字出现」
+    判断落地，命中即走，不再傻等固定时长；没给则退回「文件数是否增加」的老办法。"""
     def _set_phase(ph):
         with CAS_JOBS_LOCK:
             j = CAS_JOBS.setdefault(job_id, {})
@@ -311,37 +345,38 @@ def _run_cas_job(job_id, client, target_catalog, delete_source, expected=0, pre_
             except Exception:
                 pass
     try:
-        # 139 转存?"索引延迟"：刚保存的文件要等若干秒才出现在目录列表里?
-        # 先轮询等到目录视频数达到"基线+预期新增"，或超时（最? 3 分钟）再生成?
-        # 否则 generate 列到 0 个视? ? 生成 0 ? .cas（正是之?"转存成功但没生成"的原因）?
-        # 6.1.4 修复：等待循环必须用「递归」计数，否则保留目录结构时文件落在子目录里、
-        # 非递归计数永远看不到，会卡满 180s 才生成 CAS（表现=勾了生成CAS却像失效）。
-        # 基线也用递归统计目标目录子树，确保与轮询口径一致。
-        try:
-            baseline = _count_videos_recursive(client, target_catalog)
-        except Exception:
-            baseline = pre_count
-        deadline = time.time() + 180
+        # 139 转存是异步任务，刚保存的文件要过几秒才出现在目录列表里。
+        # 判断「落地了没」按期望文件名来（want_names）：命中一部分就先开跑，
+        # 剩下的交给 generate 的重试兜底。避免「同目录本来就有文件、数字永远对不上 → 白等满 180 秒」。
+        names = [n for n in (want_names or []) if n]
+        deadline = time.time() + 150
         with CAS_JOBS_LOCK:
             CAS_JOBS[job_id]["status"] = "waiting"
         _set_phase("转存完成，等待 139 索引更新")
+        interval = 4
         while time.time() < deadline:
-            # 先快速看直接子项（扁平转存场景足够，省去递归扫描）
-            try:
-                cur = _count_videos(client, target_catalog)
-            except Exception:
-                cur = baseline
-            landed = (expected and cur >= baseline + expected) or (not expected and cur > baseline)
-            if not landed:
-                # 直接子项没变，可能是保留结构落到了子目录：递归确认一次
+            if names:
+                found, seen = _landing(client, target_catalog, names)
+                if found:
+                    break
+                if seen:
+                    # 目录里已经有别的文件，说明列表接口是通的、只是新文件还没索引出来：
+                    # 间隔慢慢拉长，别每 4 秒扫一遍整个目录。
+                    interval = min(interval + 4, 15)
+            else:
+                # 无期望名单：退回「文件数变多」判断（跨子目录递归，口径一致）
                 try:
-                    cur_r = _count_videos_recursive(client, target_catalog)
+                    baseline = CAS_JOBS[job_id].get("baseline")
+                    if baseline is None:
+                        baseline = _count_videos_recursive(client, target_catalog)
+                        with CAS_JOBS_LOCK:
+                            CAS_JOBS[job_id]["baseline"] = baseline
+                    cur = _count_videos_recursive(client, target_catalog)
                 except Exception:
-                    cur_r = baseline
-                landed = (expected and cur_r >= baseline + expected) or (not expected and cur_r > baseline)
-            if landed:
-                break
-            time.sleep(8)
+                    cur = baseline
+                if (expected and cur >= baseline + expected) or (not expected and cur > baseline):
+                    break
+            time.sleep(interval)
         with CAS_JOBS_LOCK:
             CAS_JOBS[job_id]["status"] = "running"
         _set_phase("正在生成 CAS")
@@ -364,11 +399,13 @@ def _run_cas_job(job_id, client, target_catalog, delete_source, expected=0, pre_
         results = None
         for _attempt in range(4):
             results = client.generate(target_catalog, delete_source=delete_source, progress=_prog, on_phase=_gen_phase)
-            if results:
+            # 只有「真没东西可处理」才算空：目录里本来就有已生成的 .cas 时 results 全是
+            # skipped_*，之前会被当成空结果，白等 3 轮 × 20 秒。这里把跳过项也算作有效结果。
+            if results and any(r.get("status") in ("uploaded", "skipped_exists", "deleted") for r in results):
                 break
             if _attempt < 3:
                 _set_phase("未检测到落地文件，重试中（%d/3）" % (_attempt + 1))
-                time.sleep(20)
+                time.sleep(8)
         if not results:
             _log_debug("cas_job_empty", {"job": job_id, "expected": expected})
         with CAS_JOBS_LOCK:
@@ -669,7 +706,6 @@ class H(BaseHTTPRequestHandler):
             try:
                 results = CLIENT.generate_strm(root, public_url)
                 ok_n = sum(1 for r in results if r.get("status") == "uploaded")
-                _invalidate_list_cache()   # 目录里多了 .strm，选择器不能再看旧缓存
                 return self._json({"ok": True, "count": len(results),
                                    "uploaded": ok_n, "results": results,
                                    "publicUrl": public_url})
@@ -704,8 +740,6 @@ class H(BaseHTTPRequestHandler):
                     except Exception as e:
                         failed += 1
                         results.append({"old": old, "new": new, "status": "failed", "error": str(e)})
-                if not dry and renamed:
-                    _invalidate_list_cache()   # 改过文件名，目录缓存里的旧名不能再用
                 return self._json({"ok": True, "dryRun": dry, "renamed": renamed,
                                    "skipped": skipped, "failed": failed, "results": results})
             except Exception as e:
@@ -765,6 +799,8 @@ class H(BaseHTTPRequestHandler):
                 existing = _existing_stems(CLIENT, target_catalog)
                 files_todo = [f for f in files if _fstem_of(f) not in existing]
                 skipped = len(files) - len(files_todo)
+                # 期望落地的文件名（给后台 CAS 任务判断「转存好了没」用，命中即开跑）
+                want_names = [f.get("contentName") or f.get("coName") or "" for f in files_todo]
                 if preserve:
                     saved = transfer_share_files(
                         link_id, pwd, CLIENT.token, getattr(CLIENT, "account", ""),
@@ -798,6 +834,7 @@ class H(BaseHTTPRequestHandler):
                                             "phase": "转存完成，正在等待 139 索引更新"}
                     threading.Thread(target=_run_cas_job,
                                      args=(job_id, CLIENT, target_catalog, delete_source, saved, pre_count),
+                                     kwargs={"want_names": want_names},
                                      daemon=True).start()
                 # [合并监控] 勾选则在转存成功后把链接加入定时监控（每小时间隔扫描新增剧集）
                 # [BUG修复] 前端 share.html 提交的参数名是 add_to_monitor，后端原先只读 "monitor"，
@@ -862,7 +899,6 @@ class H(BaseHTTPRequestHandler):
             if not (sha and size and name):
                 return self._json({"ok": False, "error": "缺少参数"}, 400)
             r = CLIENT.restore(sha, size, name, parent)
-            _invalidate_list_cache(parent)   # 恢复出来的文件要立刻能在选择器里看到
             resp = {"ok": True, "result": r}
             _log_debug("restore", resp)
             return self._json(resp)
@@ -939,9 +975,6 @@ class H(BaseHTTPRequestHandler):
                         MONITOR_SCAN_JOBS[mid].update({"status": "done", "phase": "完成",
                                                        "msg": res.get("msg", ""), "added": res.get("added", 0),
                                                        "total": res.get("total", 0), "result": res})
-                    # 扫描会往目标目录转存文件 / 生成 .cas / 删原片，缓存必须作废，
-                    # 否则用户去目录选择器看不到刚转进来的东西，以为失败了。
-                    _invalidate_list_cache()
                 except Exception as _e:
                     with MONITOR_SCAN_LOCK:
                         MONITOR_SCAN_JOBS[mid].update({"status": "error", "phase": "失败",

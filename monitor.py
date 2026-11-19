@@ -59,40 +59,19 @@ def _now():
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _summary(added, total, missing=0, cas_stuck=0):
+def _summary(added, total, missing=0):
     if added:
         base = "%s 扫描：新增 %d 个视频（共 %d），已转存并生成 CAS" % (_now(), added, total)
     else:
         base = "%s 扫描：无新增（共 %d）" % (_now(), total)
     if missing:
         base += "；仍有 %d 个未落地，下轮自动重试" % missing
-    if cas_stuck:
-        base += ("；有 %d 个视频的 CAS 生成连续失败，已暂停自动重试"
-                 "（可手动到该目录点「生成 CAS」再试一次）" % cas_stuck)
     return base
 
 
 # 在途宽限：刚提交转存的任务 139 是异步搬运，文件不会立刻可见。
 # 宽限期内的文件不重复转存（防首扫/调度/手扫并发造成副本），只等它自己落地。
 PENDING_GRACE = 7200  # 秒（2 小时）
-
-# [8.0.2] 生成 CAS 失败后的补做上限：同一个视频连续失败这么多次就不再自动重试，
-# 避免「格式不支持 / 哈希算不出来」这类死结每小时空转整棵目录。
-CAS_MAX_RETRY = 3
-
-# [8.0.2] 目标目录内容变化后的回调，由 app.py 注入（作废它的目录列表缓存）。
-# 后台调度器扫描不经过 HTTP 层，不通知的话选择器会拿着旧缓存显示半小时前的内容。
-TARGET_CHANGED_HOOK = None
-
-
-def _notify_target_changed():
-    cb = TARGET_CHANGED_HOOK
-    if not callable(cb):
-        return
-    try:
-        cb()
-    except Exception:
-        pass
 
 
 def _list_dir_split(client, parent):
@@ -125,10 +104,10 @@ def _dest_of(f, flat):
 
 
 def _target_existing_paths(client, target_catalog, dest_folders, _cache=None):
-    """返回 (已存在文件的「目标相对路径」集合, 已有 .cas 的「目标相对路径」集合, all_ok)。
+    """返回目标云盘里已存在文件的「目标相对路径」集合：{(文件夹元组, 文件名)}，
+    以及 all_ok（是否所有目录都列举成功）。
 
-    第一个集合里 .cas 会去掉后缀按原视频名计入（删源后只剩 .cas，也算已存在）；
-    第二个集合单独记录「哪些视频已经有 .cas」，供 [8.0.2] 补生成判断。
+    .cas 会去掉后缀按原视频名计入（删源后只剩 .cas，也算已存在）。
     只列 dest_folders 里关心的目录，不遍历整棵树——省接口调用。
 
     ⚠️ [6.1.8] 必须按「目录 + 文件名」精确判定。6.1.7 用「全局文件名集合」去重是错的：
@@ -144,7 +123,6 @@ def _target_existing_paths(client, target_catalog, dest_folders, _cache=None):
         return _cache[parent]
 
     existing = set()
-    with_cas = set()
     all_ok = True
     for folders in dest_folders:
         cur = target_catalog
@@ -166,11 +144,8 @@ def _target_existing_paths(client, target_catalog, dest_folders, _cache=None):
             all_ok = False
             continue
         for nm in files:
-            key = (tuple(folders), nm[:-4] if nm.endswith(".cas") else nm)
-            existing.add(key)
-            if nm.endswith(".cas"):
-                with_cas.add(key)
-    return existing, with_cas, all_ok
+            existing.add((tuple(folders), nm[:-4] if nm.endswith(".cas") else nm))
+    return existing, all_ok
 
 
 def _mark(mid, status, result, **extra):
@@ -183,17 +158,16 @@ def _mark(mid, status, result, **extra):
     monitor_store.update(mid, **fields)
 
 
-# 连续失败多少次后把状态从 net_error 升级为 error（避免网络长期不通时界面一直显示「网络重试中」）
-# 配下面的 5 分钟快速重试，约 30 分钟仍不通才升级，之后回到正常间隔、不再高频打接口。
+# 连续失败多少次后把状态从 net_error 升级为 error（避免网络长期不通时界面一直显示「正常」）
 NET_ERR_ESCALATE = 6
-# 网络类异常时的快速重试间隔（秒）：比正常扫描间隔短，网络恢复后尽快自动补扫
+# 处于异常状态时的快速重试间隔（秒）：比正常扫描间隔短，网络恢复后尽快自动补扫
 NET_ERR_RETRY_SEC = 300
 
 
 def _net_or_error(mid, prefix, e):
     """[8.0.1] 区分「网络瞬断」与「真实故障」，返回统一结果 dict。
 
-    - 网络类错误：状态记 net_error，保持 enabled、下轮照常重试，连续 6 次（5 分钟一次，约半小时）
+    - 网络类错误：状态记 net_error，保持 enabled、下轮照常重试，连续 6 次（约 6 小时）
       仍不通才升级为 error 提示用户排查网络；期间界面显示为「网络重试中」而非红色故障。
     - 业务类错误：维持原逻辑记 error。
     这样无论在 Windows 本机、Linux 服务器、Docker 容器还是群晖等环境，
@@ -282,7 +256,7 @@ def scan_one(monitor, on_phase=None):
     # 现改为：按「目标路径」精确去重；待转存 = 云盘里确实缺失的文件，一轮内直接补，自愈。
     _phase("检查云盘实况")
     dest_folders = {_dest_of(f, flat)[0] for f in files}
-    existing_paths, cas_paths, ex_ok = _target_existing_paths(client, target_catalog, dest_folders)
+    existing_paths, ex_ok = _target_existing_paths(client, target_catalog, dest_folders)
     if ex_ok:
         prev_confirmed = {f["contentID"] for f in files if _dest_of(f, flat) in existing_paths}
         todo = [f for f in files if f["contentID"] not in prev_confirmed]
@@ -294,25 +268,6 @@ def scan_one(monitor, on_phase=None):
     todo = [f for f in todo if f["contentID"] not in inflight]
     if waiting:
         _phase("等待在途转存落地", waiting=len(waiting))
-
-    # [8.0.2] CAS 补生成：以前只要「原视频已在云盘」，本轮就不会再调 generate，
-    # 于是「转存成功、CAS 生成失败」的文件永远停在原视频状态，勾了「生成CAS」也补不回来。
-    # 现在把上轮失败过的 contentID 记进 cas_fail，只要云盘里该视频还没出现 .cas，下轮就再试。
-    cas_fail = dict(monitor.get("cas_fail") or {})
-    need_cas = []
-    cas_stuck = 0   # 已放弃重试、但仍缺 .cas 的视频数（每轮都在结果里提醒，不能悄悄烂尾）
-    if monitor["auto_cas"] and ex_ok and cas_fail:
-        for f in files:
-            cid = f["contentID"]
-            if cid not in cas_fail:
-                continue
-            dest = _dest_of(f, flat)
-            if dest not in existing_paths or dest in cas_paths:
-                continue
-            if int(cas_fail.get(cid) or 0) >= CAS_MAX_RETRY:
-                cas_stuck += 1
-            else:
-                need_cas.append(f)
 
     added = 0
     last_err = ""  # 关键修复：auto_cas 关闭或无可转存新文件时该变量不会被赋值，必须在顶部初始化，否则末尾回写基线时 UnboundLocalError 导致扫描直接 500
@@ -339,54 +294,33 @@ def scan_one(monitor, on_phase=None):
             # 下轮按「云盘实况」重新差集，不会重复转存也不会漏补。
             return _net_or_error(mid, "转存失败", e)
 
-    # 4) 索引延迟 + 生成 CAS（重试）
-    # [8.0.2] 这段从 `if todo:` 里提出来：本轮没有新转存、但上轮 CAS 生成失败时也要补跑。
-    if monitor["auto_cas"] and (todo or need_cas):
-        if need_cas and not todo:
-            _phase("补生成 CAS", count=len(need_cas))
-        _phase("等待索引")
-        time.sleep(INDEX_WAIT)
-        last_err = ""
-        for attempt in range(GEN_RETRY):
-            _phase("生成 CAS" if attempt == 0 else "生成 CAS（重试 %d）" % (attempt + 1))
-            try:
-                client.generate(target_catalog, delete_source=monitor["delete_source"])
-                last_err = ""
-                break
-            except TokenExpired:
-                _mark(mid, "paused", "登录已失效，已暂停（网页重新登录后自动恢复）")
-                return {"status": "paused", "msg": "登录已失效"}
-            except Exception as e:
-                last_err = str(e)
-                if attempt < GEN_RETRY - 1:
-                    time.sleep(GEN_RETRY_WAIT)
-        if last_err:
-            # 生成 CAS 失败：记下失败的 contentID（保留计数，不删），下轮扫描按「云盘里还没 .cas」
-            # 自动补生成；达到 CAS_MAX_RETRY 次就停止自动重试，但每轮结果里持续提醒，不悄悄烂尾。
-            for cid in (submitted_ids or [f["contentID"] for f in need_cas]):
-                cas_fail[cid] = int(cas_fail.get(cid) or 0) + 1
-            given_up = sum(1 for c in cas_fail.values() if int(c) >= CAS_MAX_RETRY)
-            tail = ("；%d 个文件已连续失败 %d 次，停止自动重试" % (given_up, CAS_MAX_RETRY)
-                    if given_up else "；下轮扫描自动重试")
-            net = is_network_error(Exception(last_err))
-            _mark(mid, ("net_error" if net else "error"),
-                  "生成CAS失败" + tail + "：" + last_err, cas_fail=cas_fail)
-            return {"status": ("net_error" if net else "error"), "msg": "生成CAS失败: " + last_err}
-        # 本轮生成成功：之前失败过的全部作废，别让它们下轮再触发一轮空扫描
-        if cas_fail:
-            cas_fail = {}
-            cas_stuck = 0
-    elif cas_fail and ex_ok:
-        # 没有要补生成的：把「云盘里已经有 .cas」的失败记录剔掉，只留下真正还缺的和已放弃的
-        dest_by_cid = {f["contentID"]: _dest_of(f, flat) for f in files}
-        cas_fail = {cid: c for cid, c in cas_fail.items()
-                    if dest_by_cid.get(cid) not in cas_paths}
+        # 4) 索引延迟 + 生成 CAS（重试）
+        if monitor["auto_cas"]:
+            _phase("等待索引")
+            time.sleep(INDEX_WAIT)
+            last_err = ""
+            for attempt in range(GEN_RETRY):
+                _phase("生成 CAS" if attempt == 0 else "生成 CAS（重试 %d）" % (attempt + 1))
+                try:
+                    client.generate(target_catalog, delete_source=monitor["delete_source"])
+                    last_err = ""
+                    break
+                except TokenExpired:
+                    _mark(mid, "paused", "登录已失效，已暂停（网页重新登录后自动恢复）")
+                    return {"status": "paused", "msg": "登录已失效"}
+                except Exception as e:
+                    last_err = str(e)
+                    if attempt < GEN_RETRY - 1:
+                        time.sleep(GEN_RETRY_WAIT)
+            if last_err:
+                # 生成 CAS 失败时区分网络类：网络问题下轮自愈，不刷成 error 让人手动点
+                return _net_or_error(mid, "生成CAS失败", Exception(last_err))
 
     # 5) 回写基线（[6.1.8] 关键修复）：基线只收录「已确认在目标云盘里真实存在」的文件，
     #    没落地的下轮扫描自动重试；在途文件记入 pending_files 宽限管理，防止重复转存。
     _phase("确认落地")
     # 注意：这里必须重新列举（不能用转存前的缓存），139 转存是异步任务，要拿到最新实况
-    confirmed_paths, _, cf_ok = _target_existing_paths(client, target_catalog, dest_folders)
+    confirmed_paths, cf_ok = _target_existing_paths(client, target_catalog, dest_folders)
     if cf_ok:
         confirmed_ids = {f["contentID"] for f in files if _dest_of(f, flat) in confirmed_paths}
         missing = len(files) - len(confirmed_ids)
@@ -402,14 +336,12 @@ def scan_one(monitor, on_phase=None):
         missing = 0
         new_pending = pending
 
-    _mark(mid, "ok", _summary(added, len(files), missing, cas_stuck),
+    _mark(mid, ("error" if last_err else "ok"),
+          (("生成CAS失败：" + last_err) if last_err else _summary(added, len(files), missing)),
           last_files=sorted(base_ids),
-          pending_files=new_pending,
-          cas_fail=cas_fail)
-    if added or need_cas:
-        _notify_target_changed()
+          pending_files=new_pending)
     _phase("完成", added=added)
-    return {"status": "ok", "added": added, "total": len(files)}
+    return {"status": ("error" if last_err else "ok"), "added": added, "total": len(files)}
 
 
 # 扫描串行性：后台首扫线程、调度器、手动「立即扫描」共用 _scan_lock，
@@ -554,9 +486,7 @@ class MonitorScheduler(threading.Thread):
                     iv = max(MIN_INTERVAL, int(m.get("interval_min") or MIN_INTERVAL)) * 60
                     # [8.0.1] 网络异常状态用更短的间隔快速重试（5 分钟），不必等满 1 小时：
                     # 家庭宽带/Docker DNS 抖动通常几十秒就恢复，早点重试能自动补上本轮更新。
-                    # [8.0.2] 只对 net_error 生效。业务性 error（空间不足、无权限、格式不支持）
-                    # 5 分钟一次毫无意义，还会持续打 139 接口甚至触发限流，仍按正常间隔来。
-                    if m.get("status") == "net_error":
+                    if m.get("status") in ("net_error", "error"):
                         iv = min(iv, NET_ERR_RETRY_SEC)
                     last = m.get("last_scan")
                     if not last:

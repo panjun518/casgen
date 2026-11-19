@@ -88,7 +88,7 @@ def _gen_lock_for(root):
 #        139 遇到同名不会拒绝，而是另存成 "name (1).cas" 副本。修复三件套：① 同一目标目录串行锁
 #        （_gen_lock_for），杜绝并发快照过期；② 上传前实时问 139 是否已存在同名 cas，有则跳过；
 #        ③ upload_cas 自身再加「已存在即跳过」，让 139 永远没机会用 auto_rename 造副本。
-__version__ = "8.0.2"
+__version__ = "8.0.5"
 
 
 # ============================ 签名相关（来自 52pojie 逆向） ============================
@@ -136,6 +136,22 @@ _AUTH_FAIL_CODES = {"05050006", "04000005"}
 _AUTH_FAIL_KW = ("token", "失效", "过期", "未登录", "重新登录", "重新登陆",
                 "登录已", "未授权", "unauthorized", "please login",
                 "auth fail", "auth expired", "login expired")
+
+
+_STALE_HOST_CODES = {"05050006", "05050001", "05040001", "990001"}
+
+
+def _looks_like_stale_host(data):
+    """判断「个人云 host 失效 / 服务端暂无权限」，这类错误换个 host 重来通常就好。"""
+    if not isinstance(data, dict):
+        return False
+    if data.get("_error") is not None or data.get("_raw") is not None:
+        return False
+    code = str(data.get("code") or data.get("errorCode") or "")
+    msg = str(data.get("message") or data.get("errorMsg") or "")
+    if code in _STALE_HOST_CODES:
+        return True
+    return ("暂无权限" in msg) or ("404" in msg)
 
 
 def _detect_auth_failure(data):
@@ -267,6 +283,12 @@ def _friendly_net_msg(url, e):
 class Yun139:
     # 路由策略接口（host 固定）
     ROUTE_HOST = "https://user-njs.yun.139.com"
+    ROUTE_HOSTS = ("https://user-njs.yun.139.com",)
+    # [8.0.5] 拿不到路由时兜底用的个人云 host。
+    # 实测：`/user/route/qryRoutePolicy` 在服务端调度期间会整段时间回 05050006「暂无权限」，
+    # 而 personal-kd-njs 这个 host 一直能正常列目录/上传——与其干等路由接口，
+    # 不如直接用兜底 host 顶上（真失效了 personal_post 会自动重新问路由）。
+    DEFAULT_PERSONAL_HOST = "https://personal-kd-njs.yun.139.com/hcy"
     ROUTE_PATH = "/user/route/qryRoutePolicy"
 
     def __init__(self, authorization: str):
@@ -353,7 +375,13 @@ class Yun139:
         return obj
 
     # ---------- 路由策略：拿真实 host ----------
-    def request_route_policy(self):
+    def request_route_policy(self, host=None):
+        """问 139 要真实个人云 host。
+
+        [8.0.4] 这个接口会间歇性返回 {"code":"05050006","message":"暂无权限！","data":null}
+        （服务端限流/灰度抖动，不是 token 失效——同样 token 隔几秒就正常了）。
+        以前一失败就直接抛，整个列表/生成链路当场断掉，界面上看起来就是「卡在等待」。
+        现在失败自动重试 + 换备用域名再试，尽量不让用户看到这个错。"""
         body = {
             "userInfo": {
                 "userType": 1,
@@ -362,7 +390,32 @@ class Yun139:
             },
             "modAddrType": 1,
         }
-        resp = self._post_json(self.ROUTE_HOST + self.ROUTE_PATH, self.route_headers, body)
+        last_err = None
+        for _cand in ([host] if host else list(self.ROUTE_HOSTS)):
+            for _attempt in range(3 if _cand == (host or self.ROUTE_HOSTS[0]) else 1):
+                try:
+                    return self._route_once(_cand, body)
+                except NetworkError:
+                    raise
+                except RuntimeError as e:
+                    last_err = e
+                    s = str(e)
+                    # 404 / 域名不对：换下一个候选域名，别在死路上重试
+                    if "404" in s or "Route Not Found" in s:
+                        break
+                    time.sleep(1.5)
+        raise last_err or RuntimeError("获取个人云 host 失败")
+
+    def _route_once(self, host, body):
+        saved = self.ROUTE_HOST
+        self.ROUTE_HOST = host
+        try:
+            return self._route_once_inner(host, body)
+        finally:
+            self.ROUTE_HOST = saved
+
+    def _route_once_inner(self, host, body):
+        resp = self._post_json(host + self.ROUTE_PATH, self.route_headers, body)
         if isinstance(resp, dict) and resp.get("_raw") is not None:
             raise RuntimeError("路由策略返回非JSON(host=%s): %s" % (self.ROUTE_HOST, str(resp["_raw"])[:800]))
         if isinstance(resp, dict) and resp.get("_error") is not None:
@@ -375,45 +428,62 @@ class Yun139:
         # 防御：data 可能为 null（接口常返回 {"data": null, "errorCode":..., "errorMsg":...}）
         data = resp.get("data") if isinstance(resp, dict) else None
         if not isinstance(data, dict):
-            raise RuntimeError("路由策略返回异常(data 非对象, host=%s): %s"
-                               % (self.ROUTE_HOST, json.dumps(resp, ensure_ascii=False)[:800]))
+            _code = str((resp or {}).get("code") or "")
+            _msg = (resp or {}).get("message") or ""
+            # 05050006「暂无权限」= 服务端抖动/限流，不是账号问题：调用方会重试
+            raise RuntimeError("路由策略返回异常(data 非对象, host=%s, code=%s, msg=%s, pid=%s, tid=%s): %s"
+                               % (host, _code, _msg, os.getpid(), threading.get_ident(), json.dumps(resp, ensure_ascii=False)[:400]))
         lst = data.get("routePolicyList") or []
         self.all_modules = [(p.get("modName"), p.get("httpsUrl")) for p in lst]
         if not lst:
             raise RuntimeError("路由策略未返回任何模块(host=%s): %s"
-                               % (self.ROUTE_HOST, json.dumps(resp, ensure_ascii=False)[:800]))
+                               % (host, json.dumps(resp, ensure_ascii=False)[:800]))
         # 选择模块：prefer_module 优先 > 精确 personal > 包含 personal
-        host = None
+        pick = None
         pref = getattr(self, "prefer_module", None)
         if pref:
             for p in lst:
                 if p.get("modName") == pref:
-                    host = p.get("httpsUrl"); break
-        if not host:
+                    pick = p.get("httpsUrl"); break
+        if not pick:
             for p in lst:
                 if p.get("modName") == "personal":
-                    host = p.get("httpsUrl"); break
-        if not host:
+                    pick = p.get("httpsUrl"); break
+        if not pick:
             for p in lst:
                 if "personal" in (p.get("modName") or "").lower():
-                    host = p.get("httpsUrl"); break
-        if not host:
+                    pick = p.get("httpsUrl"); break
+        if not pick:
             # 没匹配到 personal，把全部模块列出来让用户看
             raise RuntimeError("路由策略里没有 personal 模块，全部模块=" + json.dumps(self.all_modules, ensure_ascii=False)[:600])
-        self.host = host
+        self.host = pick
         return {"host": self.host}
 
     def _ensure_host(self):
         if not self.host:
-            r = self.request_route_policy()
-            if not self.host:
-                raise RuntimeError("无法获取个人云 host：" + json.dumps(r, ensure_ascii=False)[:300])
+            try:
+                r = self.request_route_policy()
+                if not self.host:
+                    raise RuntimeError("无法获取个人云 host：" + json.dumps(r, ensure_ascii=False)[:300])
+            except NetworkError:
+                raise                      # 本机完全不通网：上层按网络问题处理
+            except RuntimeError as e:
+                # 路由接口整段时间不可用（05050006）：改用兜底 host，不让整条链路断掉
+                print("[route] fallback -> %s (%s)" % (self.DEFAULT_PERSONAL_HOST, str(e)[:120]), flush=True)
+                self.host = self.DEFAULT_PERSONAL_HOST
         return self.host
 
     # ---------- 个人云请求封装 ----------
     def personal_post(self, path, body):
         host = self._ensure_host()
         data = self._post_json(host + path, self.personal_headers, body)
+        # 个人云 host 是 139 动态分配的（personal-kd-njs / personal-njs ...），
+        # 会随服务端调度变化失效，表现为 code=05050006 暂无权限 / 404。
+        # 命中时清掉缓存的 host、重新问一次路由并用新 host 重发一次，避免整条链路直接报错。
+        if _looks_like_stale_host(data):
+            self.host = None
+            host = self._ensure_host()
+            data = self._post_json(host + path, self.personal_headers, body)
         # 统一在个人云层识别登录失效，命中即抛 TokenExpired，
         # 上层（app.py 路由 / 监控线程）捕获后提示重登并暂停。
         _detect_auth_failure(data)
@@ -438,6 +508,50 @@ class Yun139:
         return it.get("size") or it.get("fileSize") or it.get("contentSize") or 0
 
     # ---------- 目录遍历（POST {host}/file/list） ----------
+    # 列表接口本身很慢（单页 100 条、每页一次 POST），而「等转存落地 / 判断哪些集要处理」
+    # 都需要反复列同一个目录。这里加一个短 TTL 缓存：几秒内重复列同一目录直接复用结果，
+    # 把「卡好几分钟」压到秒级。上传/删除等写操作前会显式失效，不会误判。
+    _LIST_TTL = 6.0
+    _LIST_CACHE = {}
+    _LIST_CACHE_MAX = 256
+    _LIST_LOCK = threading.Lock()
+
+    # 根目录不用缓存：判断「转存落地」「扫新文件」全靠它，宁可多一次请求也别读旧数据
+    _NO_CACHE_PARENTS = ("/", "root", "")
+
+    def invalidate_list(self, parent=None):
+        """清掉目录列表缓存（写操作后调用，避免读到旧数据）。parent 为空则全清。"""
+        with self._LIST_LOCK:
+            if parent is None:
+                self._LIST_CACHE.clear()
+            else:
+                self._LIST_CACHE.pop(str(parent or "/"), None)
+
+    def _list_cached(self, parent, cursor=None, ttl=None):
+        # 默认完全不用缓存：转存落地判断 / 增量扫描对「新文件看不看得见」极其敏感。
+        # 目录缓存曾导致「等待 139 索引更新」反复等满超时（每轮都读到同一份旧列表），
+        # 宁可多一次 POST 也不能读旧数据。确实需要缓存的调用显式传 ttl 才启用。
+        use_cache = (ttl is not None) and str(parent or "") not in self._NO_CACHE_PARENTS
+        key = (str(parent or "/"), str(cursor or ""))
+        now = time.time()
+        if use_cache:
+            with self._LIST_LOCK:
+                hit = self._LIST_CACHE.get(key)
+                if hit and (now - hit[0]) < (ttl if ttl is not None else self._LIST_TTL):
+                    return list(hit[1]), hit[2], hit[3]
+        items, nxt, data = self.list_dir(parent, cursor)
+        # 只缓存「正常返回」的页；出错的页不缓存，下一轮重新请求（否则会把异常结果锁住 6 秒）。
+        # 判断要严：_raw/_error/暂无权限 之外，success=false 一律不缓存。
+        _bad = isinstance(data, dict) and (
+            data.get("_raw") is not None or data.get("_error") is not None
+            or data.get("success") is False)
+        if use_cache and items and not _bad:
+            with self._LIST_LOCK:
+                if len(self._LIST_CACHE) > self._LIST_CACHE_MAX:
+                    self._LIST_CACHE.clear()
+                self._LIST_CACHE[key] = (now, list(items), nxt, data)
+        return list(items), nxt, data
+
     def list_dir(self, parent, cursor=None):
         if not parent or parent in ("root", "/"):
             parent = "/"           # 个人云根目录 parentFileId 用 "/"
@@ -471,15 +585,20 @@ class Yun139:
                                % (self.host, msg, json.dumps(data, ensure_ascii=False)[:600]))
         return items, nxt, data
 
-    def iter_all(self, root, max_depth=20):
+    def iter_all(self, root, max_depth=20, shallow_first=False):
+        """深度优先遍历整棵子树。
+
+        shallow_first=True 时先遍历完本层、再深入子目录（广度优先）。
+        用途：转存的文件通常直接落在目标目录这一层，而一次性递归扫完整棵树要几十秒；
+        先看本层能秒级判断「落地了没」，避免「等待 139 索引更新」白等满 150 秒。"""
         stack = [(root, 0)]
         while stack:
-            parent, depth = stack.pop()
+            parent, depth = (stack.pop(0) if shallow_first else stack.pop())
             if depth > max_depth:
                 continue
             cursor = None
             while True:
-                items, cursor, _ = self.list_dir(parent, cursor)
+                items, cursor, _ = self._list_cached(parent, cursor)
                 if not items:
                     break
                 for it in items:
@@ -544,9 +663,11 @@ class Yun139:
         用实时查询而非启动快照，才能挡住「并发/不同 root 路径指向同一文件夹」造成的漏判。"""
         try:
             pid = parent if parent not in ("root", "/", "") else "/"
+            # 用缓存版列表：生成 CAS 时每个文件都要查一次，一集一次 POST 是「生成阶段也很慢」
+            # 的来源。缓存 TTL 只有几秒，且每次上传成功后会失效该目录，不会漏判。
             cursor = None
             while True:
-                items, cursor, _ = self.list_dir(pid, cursor)
+                items, cursor, _ = self._list_cached(pid, cursor)
                 for it in (items or []):
                     if not self._is_folder(it) and self._name(it) == name:
                         return True
@@ -637,8 +758,9 @@ class Yun139:
                 resp["_complete"] = comp
             except Exception as e:
                 resp["_complete_error"] = str(e)
-        # 回查确认文件真的出现（二次保险）
+        # 刚写完目录内容已变：先失效缓存，再回查确认文件真的出现（二次保险）
         if file_id:
+            self.invalidate_list(parent)
             try:
                 resp["_verify_found"] = self._verify_file(parent, file_id)
             except Exception:

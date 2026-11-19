@@ -1,13 +1,17 @@
 __pycache__/
 *.pyc
 casgen_debug.log
-casgen*.log
 .DS_Store
 *.fpk
 casgen_auth.json
 casgen_monitors.json
+
+# 本地产物 / 备份，不进仓库
+*.bak
+*.bak.*
+*.log
 casgen_dir_history.json
-项目总结.md
-commit_msg.txt
-.msg
-commit_msg.txt
+caiyun_sign.py
+.github/workflows/push-805.yml
+app.py.bak-1111
+index.html.bak-1111
